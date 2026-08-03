@@ -7,7 +7,7 @@
 --
 -- Run from the repository root with:
 --   nvim --headless -u NONE -i NONE --cmd "set noswapfile" \
---     +"luafile tests/duet_edits_bench.lua" +"qa!"
+--     +"luafile tests/bench/duet_edits.lua" +"qa!"
 
 local api = vim.api
 

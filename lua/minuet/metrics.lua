@@ -1,6 +1,10 @@
 local M = {}
 
 local uv = vim.uv or vim.loop
+local aggregate_ops = require 'minuet.metrics.aggregate'
+local lifecycle_ops = require 'minuet.metrics.lifecycle'
+local jsonl_ops = require 'minuet.metrics.jsonl'
+local session_format = require 'minuet.metrics.session_format'
 
 local DEFAULT_CONFIG = {
     enabled = true,
@@ -29,11 +33,6 @@ local FRONTENDS = {
     lsp_inline_completion = true,
 }
 
-local LIFECYCLE_FRONTENDS = {
-    virtualtext = true,
-    duet = true,
-}
-
 local STATUSES = {
     success = true,
     partial = true,
@@ -43,16 +42,6 @@ local STATUSES = {
     invalid_response = true,
     empty_response = true,
     spawn_error = true,
-}
-
-local LIFECYCLE_KINDS = {
-    preview_shown = true,
-    accepted = true,
-    dismissed = true,
-    stale = true,
-    parse_failed = true,
-    filtered = true,
-    reverted = true,
 }
 
 local REASONS = {
@@ -78,31 +67,6 @@ local REASONS = {
     too_many_lines = true,
     too_many_bytes = true,
     ['repeat'] = true,
-}
-
-local BUILTIN_PROVIDERS = {
-    openai = true,
-    openai_compatible = true,
-    openai_fim_compatible = true,
-    codestral = true,
-    gemini = true,
-    claude = true,
-}
-
-local LOG_EVENTS = {
-    cycle_started = true,
-    request_started_pre = true,
-    request_attempted = true,
-    request_started = true,
-    request_finished = true,
-    with_result = true,
-    preview_shown = true,
-    accepted = true,
-    dismissed = true,
-    stale = true,
-    parse_failed = true,
-    filtered = true,
-    reverted = true,
 }
 
 local REQUEST_EVENTS = {
@@ -207,56 +171,6 @@ end
 
 local current_config = normalize_config(DEFAULT_CONFIG)
 
----@param capacity integer
----@return table
-local function new_ring(capacity)
-    return {
-        capacity = capacity,
-        count = 0,
-        next = 1,
-        samples = 0,
-        values = {},
-    }
-end
-
----@param capacity integer
----@return table
-local function new_channel(capacity)
-    return {
-        cycles = {
-            started = 0,
-            with_result = 0,
-            preview_shown = 0,
-            accepted = 0,
-            accepted_visible = 0,
-            dismissed = 0,
-            stale = 0,
-            parse_failed = 0,
-            filtered = 0,
-            reverted = 0,
-        },
-        requests = {
-            attempted = 0,
-            started = 0,
-            finished = 0,
-            outcomes = {
-                success = 0,
-                partial = 0,
-                timeout = 0,
-                cancelled = 0,
-                transport_error = 0,
-                invalid_response = 0,
-                empty_response = 0,
-                spawn_error = 0,
-            },
-        },
-        latency = {
-            request = new_ring(capacity),
-            first_preview = new_ring(capacity),
-        },
-    }
-end
-
 local session_nonce = 0
 
 ---@return table
@@ -269,17 +183,7 @@ local function new_aggregate()
         tostring(session_nonce),
     }, '-')
 
-    return {
-        session_id = session_id,
-        started_at = os.time(),
-        started_ns = started_ns,
-        channels = {
-            completion = new_channel(current_config.max_latency_samples),
-            duet = new_channel(current_config.max_latency_samples),
-        },
-        dropped_late_events = 0,
-        dropped_log_records = 0,
-    }
+    return aggregate_ops.new_aggregate(session_id, os.time(), started_ns, current_config.max_latency_samples)
 end
 
 local aggregate = new_aggregate()
@@ -293,10 +197,7 @@ local cycles = {}
 local requests = {}
 
 local event_error_notified = false
----@type table?
 local logger
-local flush_logger
-local arm_logger_timer
 
 ---@param message string
 ---@param level integer
@@ -329,356 +230,23 @@ local function dispatch_event(event, payload)
     end
 end
 
----@param ring table
----@return number[]
-local function ring_values(ring)
-    local values = {}
-    if ring.count == 0 then
-        return values
-    end
-
-    local first = ring.count == ring.capacity and ring.next or 1
-    for offset = 0, ring.count - 1 do
-        local index = ((first + offset - 1) % ring.capacity) + 1
-        values[#values + 1] = ring.values[index]
-    end
-    return values
-end
-
----@param ring table
----@param capacity integer
-local function resize_ring(ring, capacity)
-    if ring.capacity == capacity then
-        return
-    end
-
-    local values = ring_values(ring)
-    local first = math.max(1, #values - capacity + 1)
-    ring.values = {}
-    ring.count = 0
-    ring.capacity = capacity
-
-    for index = first, #values do
-        ring.count = ring.count + 1
-        ring.values[ring.count] = values[index]
-    end
-    ring.next = ring.count == capacity and 1 or ring.count + 1
-end
-
----@param ring table
----@param value number
-local function add_latency(ring, value)
-    resize_ring(ring, current_config.max_latency_samples)
-    ring.samples = ring.samples + 1
-    ring.values[ring.next] = value
-    if ring.count < ring.capacity then
-        ring.count = ring.count + 1
-    end
-    ring.next = (ring.next % ring.capacity) + 1
-end
-
----@param timer any
-local function close_timer(timer)
-    if not timer then
-        return
-    end
-    pcall(timer.stop, timer)
-    local ok, closing = pcall(timer.is_closing, timer)
-    if not ok or not closing then
-        pcall(timer.close, timer)
-    end
-end
-
----@param log table
-local function run_flush_callbacks(log)
-    local callbacks = log.flush_callbacks
-    log.flush_callbacks = {}
-    for _, callback in ipairs(callbacks) do
-        local function invoke()
-            pcall(callback)
-        end
-        if vim.in_fast_event and vim.in_fast_event() then
-            vim.schedule(invoke)
-        else
-            invoke()
-        end
-    end
-end
-
----@param log table
-local function cleanup_logger(log)
-    if not log then
-        return
-    end
-    log.active = false
-    if log.timer then
-        close_timer(log.timer)
-        log.timer = nil
-    end
-    log.queue = {}
-    run_flush_callbacks(log)
-end
-
----@param log table
----@param message string
-local function fail_logger(log, message)
-    if not log.active then
-        return
-    end
-    log.active = false
-    if log.timer then
-        close_timer(log.timer)
-        log.timer = nil
-    end
-    log.queue = {}
-    log.writing = false
-    if not log.failure_notified then
-        log.failure_notified = true
-        safe_notify(message, vim.log.levels.WARN)
-    end
-    run_flush_callbacks(log)
-end
-
----@param fd integer
----@param callback fun(error: any)
-local function close_file(fd, callback)
-    local ok = pcall(uv.fs_close, fd, function(err)
-        callback(err)
-    end)
-    if not ok then
-        callback(true)
-    end
-end
-
----@param log table
-local function finish_logger_batch(log)
-    log.writing = false
-    if not log.active then
-        run_flush_callbacks(log)
-        return
-    end
-
-    if #log.queue > 0 then
-        if log.flush_requested then
-            flush_logger(log)
-        else
-            arm_logger_timer(log)
-        end
-        return
-    end
-
-    log.flush_requested = false
-    run_flush_callbacks(log)
-end
-
-flush_logger = function(log)
-    if not log or not log.active or log.writing then
-        return
-    end
-    if #log.queue == 0 then
-        log.flush_requested = false
-        run_flush_callbacks(log)
-        return
-    end
-
-    if log.timer then
-        close_timer(log.timer)
-        log.timer = nil
-    end
-
-    local batch = log.queue
-    log.queue = {}
-    local data = table.concat(batch, '\n') .. '\n'
-    log.writing = true
-
-    local open_ok = pcall(uv.fs_open, log.path, 'a', 384, function(open_err, fd)
-        if open_err or not fd then
-            fail_logger(log, 'Minuet metrics JSONL logger failed and was disabled.')
-            return
-        end
-
-        local function abort_write(message)
-            close_file(fd, function()
-                fail_logger(log, message)
-            end)
-        end
-
-        local function stat_and_write()
-            if not log.active then
-                close_file(fd, function() end)
-                return
-            end
-
-            local stat_ok = pcall(uv.fs_fstat, fd, function(stat_err, stat)
-                if stat_err or type(stat) ~= 'table' or type(stat.size) ~= 'number' then
-                    abort_write 'Minuet metrics JSONL logger failed and was disabled.'
-                    return
-                end
-                if stat.size >= log.max_file_size or stat.size + #data > log.max_file_size then
-                    abort_write 'Minuet metrics JSONL logger reached its size limit and was disabled.'
-                    return
-                end
-
-                local function write_from(written)
-                    if not log.active then
-                        close_file(fd, function() end)
-                        return
-                    end
-                    if written >= #data then
-                        close_file(fd, function(close_err)
-                            if close_err then
-                                fail_logger(log, 'Minuet metrics JSONL logger failed and was disabled.')
-                            else
-                                finish_logger_batch(log)
-                            end
-                        end)
-                        return
-                    end
-
-                    local write_ok = pcall(
-                        uv.fs_write,
-                        fd,
-                        data:sub(written + 1),
-                        stat.size + written,
-                        function(write_err, bytes_written)
-                            if write_err or type(bytes_written) ~= 'number' or bytes_written <= 0 then
-                                abort_write 'Minuet metrics JSONL logger failed and was disabled.'
-                                return
-                            end
-                            write_from(written + bytes_written)
-                        end
-                    )
-                    if not write_ok then
-                        abort_write 'Minuet metrics JSONL logger failed and was disabled.'
-                    end
-                end
-
-                write_from(0)
-            end)
-            if not stat_ok then
-                abort_write 'Minuet metrics JSONL logger failed and was disabled.'
-            end
-        end
-
-        if uv.fs_fchmod then
-            local chmod_ok = pcall(uv.fs_fchmod, fd, 384, function()
-                stat_and_write()
-            end)
-            if not chmod_ok then
-                stat_and_write()
-            end
-        else
-            stat_and_write()
-        end
-    end)
-
-    if not open_ok then
-        fail_logger(log, 'Minuet metrics JSONL logger failed and was disabled.')
-    end
-end
-
-arm_logger_timer = function(log)
-    if not log or not log.active or log.writing or log.timer or #log.queue == 0 then
-        return
-    end
-
-    local ok, timer = pcall(uv.new_timer)
-    if not ok or not timer then
-        fail_logger(log, 'Minuet metrics JSONL logger failed and was disabled.')
-        return
-    end
-
-    log.timer = timer
-    local started = pcall(timer.start, timer, log.flush_interval, 0, function()
-        if log.timer == timer then
-            log.timer = nil
-        end
-        close_timer(timer)
-        flush_logger(log)
-    end)
-    if not started then
-        log.timer = nil
-        close_timer(timer)
-        fail_logger(log, 'Minuet metrics JSONL logger failed and was disabled.')
-    end
-end
-
----@param record table
----@return table?
-local function sanitize_log_record(record)
-    if not LOG_EVENTS[record.event] then
-        return
-    end
-
-    local sanitized = {
-        schema_version = 1,
-        session_id = aggregate.session_id,
-        event = record.event,
-        timestamp = is_integer(record.timestamp) and record.timestamp or os.time(),
-    }
-
-    if CHANNELS[record.channel] then
-        sanitized.channel = record.channel
-    end
-    if FRONTENDS[record.frontend] then
-        sanitized.frontend = record.frontend
-    end
-    if BUILTIN_PROVIDERS[record.provider_id] then
-        sanitized.provider_id = record.provider_id
-    elseif record.provider_id ~= nil then
-        sanitized.provider_id = 'custom'
-    end
-
-    for _, key in ipairs { 'cycle_id', 'request_id', 'n_requests', 'request_idx' } do
-        if is_integer(record[key]) and record[key] >= 0 then
-            sanitized[key] = record[key]
-        end
-    end
-
-    if STATUSES[record.status] then
-        sanitized.status = record.status
-    end
-    sanitized.reason = sanitize_reason(record.reason)
-
-    for _, key in ipairs { 'duration_ms', 'elapsed_ms' } do
-        local value = record[key]
-        if type(value) == 'number' and value == value and value >= 0 and value ~= math.huge then
-            sanitized[key] = value
-        end
-    end
-
-    return sanitized
-end
+logger = jsonl_ops.new {
+    get_config = function()
+        return current_config
+    end,
+    get_aggregate = function()
+        return aggregate
+    end,
+    is_integer = is_integer,
+    sanitize_reason = sanitize_reason,
+    safe_notify = safe_notify,
+}
 
 ---@param record table
 local function enqueue_log(record)
-    local log = logger
-    if not current_config.enabled or not log or not log.active then
-        return
+    if current_config.enabled then
+        logger.enqueue(record)
     end
-
-    local sanitized = sanitize_log_record(record)
-    if not sanitized then
-        return
-    end
-
-    if #log.queue >= log.max_queue then
-        aggregate.dropped_log_records = aggregate.dropped_log_records + 1
-        if not log.queue_notified then
-            log.queue_notified = true
-            safe_notify('Minuet metrics JSONL queue is full; records are being dropped.', vim.log.levels.WARN)
-        end
-        return
-    end
-
-    local ok, encoded = pcall(vim.json.encode, sanitized)
-    if not ok or type(encoded) ~= 'string' then
-        fail_logger(log, 'Minuet metrics JSONL logger failed and was disabled.')
-        return
-    end
-
-    log.queue[#log.queue + 1] = encoded
-    arm_logger_timer(log)
 end
 
 ---@param cycle table
@@ -695,6 +263,24 @@ local function cycle_log_record(cycle, event)
         n_requests = cycle.n_requests,
     }
 end
+
+local lifecycle_options = {
+    enabled = function()
+        return current_config.enabled
+    end,
+    aggregate = function()
+        return aggregate
+    end,
+    sanitize_reason = sanitize_reason,
+    now_ns = uv.hrtime,
+    timestamp = os.time,
+    add_latency = function(ring, value)
+        aggregate_ops.add_latency(ring, value, current_config.max_latency_samples)
+    end,
+    cycle_log_record = cycle_log_record,
+    enqueue_log = enqueue_log,
+    dispatch_event = dispatch_event,
+}
 
 ---@param cycle table
 ---@return table
@@ -970,7 +556,7 @@ function M.request_finished(request_id, result)
         channel.requests.finished = channel.requests.finished + 1
         channel.requests.outcomes[status] = channel.requests.outcomes[status] + 1
         if duration_ms and request.started_counted then
-            add_latency(channel.latency.request, duration_ms)
+            aggregate_ops.add_latency(channel.latency.request, duration_ms, current_config.max_latency_samples)
         end
 
         local record = cycle_log_record(cycle, 'request_finished')
@@ -1030,102 +616,14 @@ end
 ---@param reason? string
 ---@return boolean recorded
 function M.suggestion_event(cycle_id, kind, reason)
-    if not LIFECYCLE_KINDS[kind] then
+    if not lifecycle_ops.kinds[kind] then
         return false
     end
-
     local cycle = tracked_cycle(cycle_id)
-    if not cycle or cycle.lifecycle[kind] then
+    if not cycle then
         return false
     end
-
-    cycle.lifecycle[kind] = true
-    cycle.lifecycle_counted[kind] = current_config.enabled
-    reason = sanitize_reason(reason)
-    local elapsed_ms = math.max(0, (uv.hrtime() - cycle.started_ns) / 1000000)
-
-    if current_config.enabled then
-        local channel = aggregate.channels[cycle.channel]
-        channel.cycles[kind] = channel.cycles[kind] + 1
-        if kind == 'preview_shown' then
-            add_latency(channel.latency.first_preview, elapsed_ms)
-        end
-
-        if
-            cycle.lifecycle.accepted
-            and cycle.lifecycle.preview_shown
-            and cycle.lifecycle_counted.accepted
-            and cycle.lifecycle_counted.preview_shown
-            and not cycle.accepted_visible
-        then
-            cycle.accepted_visible = true
-            channel.cycles.accepted_visible = channel.cycles.accepted_visible + 1
-        end
-
-        local record = cycle_log_record(cycle, kind)
-        record.reason = reason
-        record.elapsed_ms = elapsed_ms
-        enqueue_log(record)
-    end
-
-    local frontend = LIFECYCLE_FRONTENDS[cycle.frontend] and cycle.frontend
-        or (cycle.channel == 'duet' and 'duet' or 'virtualtext')
-    dispatch_event('MinuetSuggestionLifecycle', {
-        schema_version = 1,
-        kind = kind,
-        channel = cycle.channel,
-        cycle_id = cycle.id,
-        provider_id = cycle.provider_id,
-        frontend = frontend,
-        timestamp = os.time(),
-        elapsed_ms = elapsed_ms,
-        reason = reason,
-    })
-    return true
-end
-
----@param ring table
----@return table
-local function latency_snapshot(ring)
-    local values = ring_values(ring)
-    table.sort(values)
-    local retained = #values
-    if retained == 0 then
-        return {
-            samples = ring.samples,
-            retained = 0,
-            p50 = nil,
-            p95 = nil,
-            max = nil,
-        }
-    end
-
-    return {
-        samples = ring.samples,
-        retained = retained,
-        p50 = values[math.ceil(retained * 0.50)],
-        p95 = values[math.ceil(retained * 0.95)],
-        max = values[retained],
-    }
-end
-
----@param source table?
----@return table
-local function channel_snapshot(source)
-    if not source then
-        source = new_channel(current_config.max_latency_samples)
-    end
-
-    local preview_shown = source.cycles.preview_shown
-    return {
-        cycles = deep_copy(source.cycles),
-        requests = deep_copy(source.requests),
-        latency_ms = {
-            request = latency_snapshot(source.latency.request),
-            first_preview = latency_snapshot(source.latency.first_preview),
-        },
-        visible_acceptance_rate = preview_shown > 0 and source.cycles.accepted_visible / preview_shown or nil,
-    }
+    return lifecycle_ops.record(cycle, kind, reason, lifecycle_options)
 end
 
 ---@return table
@@ -1140,8 +638,16 @@ function M.get()
             elapsed_ms = elapsed_ms,
         },
         channels = {
-            completion = channel_snapshot(enabled and aggregate.channels.completion or nil),
-            duet = channel_snapshot(enabled and aggregate.channels.duet or nil),
+            completion = aggregate_ops.channel_snapshot(
+                enabled and aggregate.channels.completion or nil,
+                current_config.max_latency_samples,
+                deep_copy
+            ),
+            duet = aggregate_ops.channel_snapshot(
+                enabled and aggregate.channels.duet or nil,
+                current_config.max_latency_samples,
+                deep_copy
+            ),
         },
         dropped_late_events = enabled and aggregate.dropped_late_events or 0,
         dropped_log_records = enabled and aggregate.dropped_log_records or 0,
@@ -1149,57 +655,9 @@ function M.get()
     return deep_copy(snapshot)
 end
 
----@param latency table
----@return string
-local function format_latency(latency)
-    if latency.p50 == nil then
-        return 'n/a'
-    end
-    return ('P50 %.2f ms, P95 %.2f ms, max %.2f ms'):format(latency.p50, latency.p95, latency.max)
-end
-
 ---@return string
 function M.format()
-    local snapshot = M.get()
-    if not snapshot.enabled then
-        return 'Minuet metrics are disabled.'
-    end
-
-    local lines = { ('Minuet session metrics (%.1f s)'):format(snapshot.session.elapsed_ms / 1000) }
-    for _, name in ipairs { 'completion', 'duet' } do
-        local channel = snapshot.channels[name]
-        local cycles_snapshot = channel.cycles
-        local requests_snapshot = channel.requests
-        local rate = channel.visible_acceptance_rate and ('%.1f%%'):format(channel.visible_acceptance_rate * 100)
-            or 'n/a'
-        lines[#lines + 1] = ('%s: cycles %d, results %d; requests %d attempted, %d started, %d finished'):format(
-            name,
-            cycles_snapshot.started,
-            cycles_snapshot.with_result,
-            requests_snapshot.attempted,
-            requests_snapshot.started,
-            requests_snapshot.finished
-        )
-        lines[#lines + 1] = ('  request latency: %s'):format(format_latency(channel.latency_ms.request))
-        lines[#lines + 1] = ('  preview %d, accepted %d, reverted %d, dismissed %d, stale %d, filtered %d, parse failed %d; visible acceptance %s'):format(
-            cycles_snapshot.preview_shown,
-            cycles_snapshot.accepted,
-            cycles_snapshot.reverted,
-            cycles_snapshot.dismissed,
-            cycles_snapshot.stale,
-            cycles_snapshot.filtered,
-            cycles_snapshot.parse_failed,
-            rate
-        )
-    end
-    lines[#lines + 1] = 'UI lifecycle coverage: virtual text and Duet only.'
-    if snapshot.dropped_late_events > 0 or snapshot.dropped_log_records > 0 then
-        lines[#lines + 1] = ('Dropped events: %d late, %d log records'):format(
-            snapshot.dropped_late_events,
-            snapshot.dropped_log_records
-        )
-    end
-    return table.concat(lines, '\n')
+    return session_format.format(M.get())
 end
 
 ---@return string
@@ -1212,71 +670,7 @@ end
 ---@param callback? fun()
 ---@return boolean
 function M._flush(callback)
-    local log = logger
-    if not log or not log.active then
-        if callback then
-            pcall(callback)
-        end
-        return false
-    end
-
-    if callback then
-        log.flush_callbacks[#log.flush_callbacks + 1] = callback
-    end
-    log.flush_requested = true
-    if log.timer then
-        close_timer(log.timer)
-        log.timer = nil
-    end
-    if log.writing then
-        return true
-    end
-    flush_logger(log)
-    return true
-end
-
----@param config table
-local function setup_logger(config)
-    local path = config.path
-    local default_path = path == nil
-    local directory
-    if default_path then
-        directory = vim.fs.joinpath(vim.fn.stdpath 'state', 'minuet')
-        path = vim.fs.joinpath(directory, 'metrics-' .. aggregate.session_id .. '.jsonl')
-    else
-        directory = vim.fn.fnamemodify(path, ':h')
-        if directory == '' then
-            directory = '.'
-        end
-    end
-
-    logger = {
-        active = true,
-        path = path,
-        queue = {},
-        timer = nil,
-        writing = false,
-        flush_requested = false,
-        flush_callbacks = {},
-        flush_interval = config.flush_interval,
-        max_queue = config.max_queue,
-        max_file_size = config.max_file_size,
-        queue_notified = false,
-        failure_notified = false,
-    }
-
-    local stat_ok, stat = pcall(uv.fs_stat, directory)
-    if not stat_ok or not stat then
-        local mkdir_ok = pcall(vim.fn.mkdir, directory, 'p', 448)
-        local verify_ok, verified = pcall(uv.fs_stat, directory)
-        if not mkdir_ok or not verify_ok or not verified then
-            fail_logger(logger, 'Minuet metrics JSONL logger failed and was disabled.')
-            return
-        end
-        pcall(uv.fs_chmod, directory, 448)
-    elseif default_path then
-        pcall(uv.fs_chmod, directory, 448)
-    end
+    return logger.flush(callback)
 end
 
 ---@param config? table
@@ -1289,25 +683,23 @@ function M.setup(config)
         end
     end
 
-    cleanup_logger(logger)
-    logger = nil
+    logger.cleanup()
     current_config = normalize_config(config)
 
     evict_cycles(cycle_sequence - current_config.max_tracked_cycles)
     for _, channel in pairs(aggregate.channels) do
-        resize_ring(channel.latency.request, current_config.max_latency_samples)
-        resize_ring(channel.latency.first_preview, current_config.max_latency_samples)
+        aggregate_ops.resize_ring(channel.latency.request, current_config.max_latency_samples)
+        aggregate_ops.resize_ring(channel.latency.first_preview, current_config.max_latency_samples)
     end
 
     if current_config.enabled and current_config.jsonl.enabled then
-        setup_logger(current_config.jsonl)
+        logger.setup(current_config.jsonl)
     end
     return M
 end
 
 function M._reset()
-    cleanup_logger(logger)
-    logger = nil
+    logger.cleanup()
     current_config = normalize_config(DEFAULT_CONFIG)
     cycle_sequence = 0
     request_sequence = 0

@@ -640,7 +640,7 @@ local function benchmark_quality_feedback()
             },
         },
     }
-    local quality = helpers.reload 'minuet.duet.quality'
+    local quality = helpers.reload 'minuet.duet.repeat_suppression'
     local iterations = 10000
     local started_ns = uv.hrtime()
     for index = 1, iterations do
@@ -657,7 +657,7 @@ local function benchmark_quality_feedback()
     local metrics = helpers.reload 'minuet.metrics'
     metrics._reset()
     metrics.setup { enabled = true }
-    local feedback = helpers.reload 'minuet.duet.feedback'
+    local feedback = helpers.reload 'minuet.duet.undo_feedback'
     feedback.setup()
     local bufnr = api.nvim_create_buf(true, false)
     api.nvim_set_current_buf(bufnr)

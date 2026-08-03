@@ -11,7 +11,16 @@ package.path = table.concat({
     package.path,
 }, ';')
 
-local spec_files = vim.fn.globpath(root .. '/tests', '*_spec.lua', false, true)
+local discovered_spec_files = vim.fn.globpath(root .. '/tests', '**/*_spec.lua', false, true)
+local spec_files = {}
+local seen_spec_files = {}
+for _, file in ipairs(discovered_spec_files) do
+    local normalized = vim.fs.normalize(vim.fn.fnamemodify(file, ':p'))
+    if not seen_spec_files[normalized] then
+        seen_spec_files[normalized] = true
+        spec_files[#spec_files + 1] = normalized
+    end
+end
 table.sort(spec_files)
 
 local cases = {}

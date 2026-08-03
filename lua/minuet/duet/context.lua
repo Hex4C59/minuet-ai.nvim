@@ -182,7 +182,7 @@ function M.build(bufnr, candidate, semantic)
     end
     local related_limit =
         math.min(context_config.related_files.max_chars or 0, math.floor((context_config.max_chars or 0) * 0.25))
-    local related = require('minuet.duet.related').render(bufnr, related_limit)
+    local related = require('minuet.duet.related_files').render(bufnr, related_limit)
     if related ~= '' then
         evidence[#evidence + 1] = 'Related loaded files:'
         evidence[#evidence + 1] = related

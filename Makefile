@@ -7,11 +7,11 @@ test:
 	$(NVIM) --headless -u NONE -i NONE -n +"lua require('tests.run').run()"
 
 benchmark:
-	$(NVIM) --headless -u NONE -i NONE --cmd "set noswapfile" +"luafile tests/duet_edits_bench.lua" +"luafile tests/metrics_bench.lua" +"luafile tests/cursor_tab_bench.lua" +"qa!"
+	$(NVIM) --headless -u NONE -i NONE --cmd "set noswapfile" +"luafile tests/bench/duet_edits.lua" +"luafile tests/bench/metrics.lua" +"luafile tests/bench/cursor_tab.lua" +"qa!"
 
 smoke-deepseek:
 	@test -n "$$DEEPSEEK_API_KEY" || { echo "DEEPSEEK_API_KEY is required" >&2; exit 1; }
-	$(NVIM) --headless -u NONE -i NONE -n --cmd "set noswapfile" +"luafile tests/deepseek_smoke.lua"
+	$(NVIM) --headless -u NONE -i NONE -n --cmd "set noswapfile" +"luafile tests/smoke/deepseek.lua"
 
 format:
 	$(STYLUA) lua/ tests/

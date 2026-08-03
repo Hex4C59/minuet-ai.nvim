@@ -20,7 +20,7 @@ return {
                     },
                 },
             }
-            local quality = helpers.reload 'minuet.duet.quality'
+            local quality = helpers.reload 'minuet.duet.repeat_suppression'
             helpers.expect_falsy(quality.is_repeat(edit()))
             helpers.expect_truthy(quality.is_repeat(edit()))
             helpers.expect_falsy(quality.is_repeat(edit { changedtick = 12 }))
@@ -42,7 +42,7 @@ return {
                     },
                 },
             }
-            local quality = helpers.reload 'minuet.duet.quality'
+            local quality = helpers.reload 'minuet.duet.repeat_suppression'
             helpers.expect_falsy(quality.is_repeat(edit()))
             helpers.expect_falsy(quality.is_repeat(edit()))
             helpers.expect_equal(quality._inspect().count, 0)

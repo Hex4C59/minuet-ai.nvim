@@ -15,7 +15,7 @@ return {
             vim.api.nvim_buf_set_lines(secret, 0, -1, false, { 'SECRET_SENTINEL' })
             vim.api.nvim_buf_set_name(secret, vim.fs.joinpath(vim.fn.getcwd(), 'pkg', '.env'))
 
-            local related = helpers.reload 'minuet.duet.related'
+            local related = helpers.reload 'minuet.duet.related_files'
             helpers.expect_equal(related.render(current, 4000), '')
             require('minuet').config.duet.context.related_files.enabled = true
             local rendered = related.render(current, 4000)
