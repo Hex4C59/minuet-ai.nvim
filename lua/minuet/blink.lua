@@ -1,5 +1,6 @@
 local M = {}
 local utils = require 'minuet.utils'
+local metrics = require 'minuet.metrics'
 
 if vim.tbl_isempty(vim.api.nvim_get_hl(0, { name = 'BlinkCmpItemKindMinuet' })) then
     vim.api.nvim_set_hl(0, 'BlinkCmpItemKindMinuet', { link = 'BlinkCmpItemKind' })
@@ -57,8 +58,17 @@ function M:get_completions(ctx, callback)
         utils.notify('Minuet completion started', 'verbose')
 
         local provider = require('minuet.backends.' .. config.provider)
+        local cycle_id = metrics.begin_cycle {
+            channel = 'completion',
+            frontend = 'blink',
+            provider_id = config.provider,
+        }
 
         provider.complete(context, function(data)
+            if data and next(data) then
+                metrics.cycle_has_result(cycle_id)
+            end
+
             if not data then
                 callback()
                 return
@@ -131,7 +141,10 @@ function M:get_completions(ctx, callback)
                 is_incomplete_backward = false,
                 items = items,
             }
-        end)
+        end, {
+            cycle_id = cycle_id,
+            frontend = 'blink',
+        })
     end
 
     if ctx.trigger.kind == 'manual' then

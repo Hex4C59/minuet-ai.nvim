@@ -1,6 +1,8 @@
 local M = {}
 
+---@param config? table
 function M.setup(config)
+    config = config or {}
     local default_config = require 'minuet.config'
 
     M.presets = config.presets or {}
@@ -35,7 +37,10 @@ function M.setup(config)
         end
     end
 
-    M.config = vim.tbl_deep_extend('force', default_config, config or {})
+    M.config = vim.tbl_deep_extend('force', default_config, config)
+
+    require('minuet.metrics').setup()
+    require('minuet.suggestion').reset()
 
     local has_cmp = pcall(require, 'cmp')
 
@@ -190,6 +195,10 @@ local function minuet_complete(arglead, cmdline, _)
             completion = { enable_auto_trigger = true, disable_auto_trigger = true },
             inline_completion = { enable_auto_trigger = true, disable_auto_trigger = true },
         },
+        stats = true,
+        report = function(lead)
+            return vim.fn.getcompletion(lead, 'file')
+        end,
         change_model = complete_change_model_options,
         change_provider = function()
             local providers = {}
@@ -231,7 +240,7 @@ local function minuet_complete(arglead, cmdline, _)
     if type(node) == 'function' then
         return vim.tbl_filter(function(item)
             return vim.startswith(item, arglead)
-        end, node())
+        end, node(arglead))
     elseif type(node) == 'table' then
         return vim.tbl_filter(function(item)
             return vim.startswith(item, arglead)
@@ -288,7 +297,15 @@ vim.api.nvim_create_user_command('Minuet', function(args)
 
     local command = fargs[1]
 
-    if command == 'change_model' then
+    if command == 'stats' then
+        require('minuet.metrics').notify()
+    elseif command == 'report' then
+        local patterns = {}
+        for index = 2, #fargs do
+            patterns[#patterns + 1] = fargs[index]
+        end
+        require('minuet.metrics_report').notify(patterns)
+    elseif command == 'change_model' then
         M.change_model(fargs[2])
     elseif command == 'change_preset' then
         M.change_preset(fargs[2])

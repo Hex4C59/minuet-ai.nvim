@@ -3,20 +3,17 @@ local utils = require 'minuet.duet.utils'
 
 local M = {}
 
-function M.complete(context, callback)
+M.provider_id = 'openai'
+
+function M.complete(context, callback, lifecycle)
     local options = vim.deepcopy(require('minuet').config.duet.provider_options.openai)
-    local api_key = utils.get_api_key(options.api_key)
 
-    if not api_key then
-        utils.notify('Minuet duet OpenAI API key is not set.', 'error', vim.log.levels.ERROR)
-        callback(nil)
-        return
-    end
-
+    options.provider_id = M.provider_id
     options.provider = 'openai'
     options.name = 'OpenAI'
+    options.api_key_error = 'Minuet duet OpenAI API key is not set.'
 
-    base.complete_openai_base(options, context, callback)
+    base.complete_openai_base(options, context, callback, lifecycle)
 end
 
 return M

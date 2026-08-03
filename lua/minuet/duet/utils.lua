@@ -233,25 +233,26 @@ end
 ---@param text string
 ---@param context minuet.DuetParseContext?
 ---@return minuet.DuetParseResult?, string?
+---@return 'invalid_markers'|'empty_response'?
 function M.parse_duet_response(text, context)
     local markers = get_markers()
 
     if type(text) ~= 'string' or text == '' then
-        return nil, 'empty response'
+        return nil, 'empty response', 'empty_response'
     end
 
     if count_occurrences(text, markers.editable_region_start) ~= 1 then
-        return nil, 'expected exactly one editable region start marker: ' .. text
+        return nil, 'expected exactly one editable region start marker', 'invalid_markers'
     end
 
     if count_occurrences(text, markers.editable_region_end) ~= 1 then
-        return nil, 'expected exactly one editable region end marker: ' .. text
+        return nil, 'expected exactly one editable region end marker', 'invalid_markers'
     end
 
     local start_pos, start_end = text:find(markers.editable_region_start, 1, true)
     local end_pos = text:find(markers.editable_region_end, start_end + 1, true)
     if not start_pos or not end_pos then
-        return nil, 'failed to locate editable region markers: ' .. text
+        return nil, 'failed to locate editable region markers', 'invalid_markers'
     end
 
     local inner = text:sub(start_end + 1, end_pos - 1)
@@ -271,7 +272,7 @@ function M.parse_duet_response(text, context)
         )
         inner = inner .. markers.cursor_position
     elseif cursor_marker_count > 1 then
-        return nil, 'expected exactly one cursor marker inside editable region: ' .. text
+        return nil, 'expected exactly one cursor marker inside editable region', 'invalid_markers'
     end
 
     local cursor_pos, cursor_end = inner:find(markers.cursor_position, 1, true)

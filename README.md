@@ -36,18 +36,25 @@
   - [`Minuet blink`, `Minuet cmp`](#minuet-blink-minuet-cmp)
   - [`Minuet virtualtext`](#minuet-virtualtext)
   - [`Minuet duet`](#minuet-duet)
+  - [`Minuet stats`](#minuet-stats)
+  - [`Minuet report`](#minuet-report)
   - [`Minuet lsp`](#minuet-lsp)
 - [Duet (Next Edit Prediction)](#duet-next-edit-prediction)
+  - [Automatic Prediction and Tab](#automatic-prediction-and-tab)
   - [Recent Edits](#recent-edits)
   - [TODO](#todo)
   - [Default Config](#default-config)
 - [API](#api)
   - [Virtual Text](#virtual-text)
   - [Duet](#duet)
+  - [Unified Tab](#unified-tab)
+  - [Session Metrics](#session-metrics)
+  - [Offline Quality Report](#offline-quality-report)
   - [Lualine](#lualine)
   - [Minuet Event](#minuet-event)
     - [Standard Completion Events](#standard-completion-events)
     - [Duet Events](#duet-events)
+    - [Suggestion Lifecycle](#suggestion-lifecycle)
     - [Event Data](#event-data)
 - [FAQ](#faq)
   - [Customize `cmp` ui for source icon and kind icon](#customize-cmp-ui-for-source-icon-and-kind-icon)
@@ -639,6 +646,21 @@ default_config = {
     blink = {
         enable_auto_complete = true,
     },
+    -- Session-local request and suggestion metrics. Metrics remain in memory
+    -- unless the optional JSONL logger is explicitly enabled.
+    metrics = {
+        enabled = true,
+        max_tracked_cycles = 4096,
+        max_latency_samples = 2048,
+        jsonl = {
+            enabled = false,
+            -- nil uses stdpath('state')/minuet/metrics-<session>.jsonl
+            path = nil,
+            flush_interval = 1000,
+            max_queue = 256,
+            max_file_size = 10 * 1024 * 1024,
+        },
+    },
     -- LSP is recommended only for built-in completion. If you are using
     -- `cmp` or `blink`, utilizing LSP for code completion from Minuet is *not*
     -- recommended.
@@ -813,6 +835,7 @@ Minuet AI requires API keys to function. Set the following environment variables
 - `GEMINI_API_KEY` for Gemini
 - `ANTHROPIC_API_KEY` for Claude
 - `CODESTRAL_API_KEY` for Codestral
+- `DEEPSEEK_API_KEY` for DeepSeek
 - Custom environment variable for OpenAI-compatible services (as specified in your configuration)
 
 **Note:** Provide the name of the environment variable to Minuet, not the
@@ -1397,6 +1420,32 @@ The Minuet duet command provides manual next-edit prediction controls:
 - `:Minuet duet apply`: Apply the current duet prediction.
 - `:Minuet duet dismiss`: Dismiss the current duet prediction preview.
 
+## `Minuet stats`
+
+`Minuet stats` shows request counts and latency, suggestion lifecycle counts,
+and the visible suggestion acceptance rate for the current Neovim session.
+Suggestion display and acceptance are tracked only for Minuet's virtual text
+and Duet frontends; cmp, Blink, and LSP expose request metrics only.
+
+## `Minuet report`
+
+`Minuet report` aggregates Duet lifecycle JSONL across Neovim sessions. With no
+path argument it reads the configured `metrics.jsonl.path`, or the standard
+session-file glob when no fixed path is configured. Exact paths and glob
+patterns may also be supplied:
+
+```vim
+:Minuet report
+:Minuet report /path/to/minuet/metrics-*.jsonl
+```
+
+The report deduplicates lifecycle records, checks schema and cycle integrity,
+and shows progress toward both the 100-visible early-review gate and the
+500-visible release-review gate. It includes allowlisted filtered and reverted
+counts, but never prints input paths or fields outside the metrics allowlist.
+Reaching either count does not prove the data came from real editing;
+provenance and safety must still be reviewed before tuning or release decisions.
+
 ## `Minuet lsp`
 
 The Minuet LSP command provides commands for managing the in-process LSP server:
@@ -1413,12 +1462,41 @@ The Minuet LSP command provides commands for managing the in-process LSP server:
 `Minuet duet` is Minuet's highly experimental next-edit prediction (NES)
 feature.
 
-Basic usage is manual. Bind the duet commands to your preferred keymaps, then:
+Basic usage is manual. By default, Duet ranks candidate rows in the current
+buffer from the cursor, recent edit hunks, Neovim's cached diagnostics, local
+identifier matches, and references returned by already attached LSP clients.
+LSP work is asynchronous and deadline-bounded; it never starts a language
+server. Cross-buffer edit targets remain disabled by default. Bind the duet
+commands to your preferred keymaps, then:
 
 1. Trigger `:Minuet duet predict` to request a prediction for the current edit.
-2. Review the preview rendered in the buffer.
+2. Review the preview rendered in the buffer. A remote edit initially shows a
+   `Next edit: line N` hint and a `>>` sign at the target.
 3. Apply it with `:Minuet duet apply` or discard it with
    `:Minuet duet dismiss`.
+
+With the default `jump_requires_confirmation = true`, applying a remote edit is
+a two-step action. The first apply validates the suggestion, moves the cursor,
+and reveals the diff without changing the buffer. The second apply validates it
+again and writes the edit. Local suggestions still apply in one step. The same
+behavior is used by `require('minuet.tab')`; no mapping is installed by Minuet.
+Diagnostic messages, paths, and candidate scores are not shown or written to
+metrics.
+
+To opt in to a single related-buffer target, set both `scope = 'workspace'`
+and `candidates.related_buffers = true`. Only LSP references into safe,
+modifiable, already loaded and listed buffers under the same workspace are
+eligible. Duet never opens a referenced URI. A cross-buffer suggestion always
+uses two applies: the first preserves unsaved origin changes, switches through
+the normal Buffer/jumplist path, and reveals the diff; the second revalidates
+both buffers and writes only the target. It does not save either buffer.
+
+The provider context includes the current workspace-relative path, filetype,
+bounded recently changed identifiers, and bounded nearby diagnostic messages.
+These values are not persisted by Minuet. Source from another buffer is not
+included unless `duet.context.related_files.enabled` is explicitly enabled;
+even then, only safe, already loaded buffers matched by a literal relative
+import/require are eligible.
 
 Example keymaps:
 
@@ -1471,8 +1549,8 @@ This feature is highly experimental:
   lack local GPU resources for testing.
 - Comparable small models from competitors of Google—`claude-haiku-4.5` and
   `gpt-5.4-mini`—perform poorly.
-- Given completion latency constraints, automatic duet prediction is not
-  implemented.
+- Automatic prediction is available, but remains opt-in while its quality and
+  latency are evaluated on real editing sessions.
 
 It is recommended to configure the thinking levels of the models; refer to the
 [provider sections](#providers) for guidance on managing thinking settings for
@@ -1483,6 +1561,117 @@ requests. Duet expects the model to return the complete rewritten editable
 region, including the cursor marker; if the response is truncated, the parser
 will reject it. Leave the limit unset when the provider allows that, or set it
 large enough to cover the full rewritten region.
+
+## Automatic Prediction and Tab
+
+Automatic Duet prediction is disabled by default. Enabling it sends a request
+after an eligible edit settles, so it can increase provider charges and network
+traffic. The scheduler debounces edits, throttles requests, and suppresses
+automatic requests while a Minuet Virtual Text or Duet suggestion is visible.
+
+The following example opts in and uses DeepSeek's Chat Completions endpoint.
+`DEEPSEEK_API_KEY` is the environment variable name, not the key value:
+
+```lua
+require('minuet').setup {
+    duet = {
+        provider = 'openai_compatible',
+        auto_trigger = {
+            enabled = true,
+            debounce = 900,
+            throttle = 1500,
+            -- Optional declarative overrides. Unspecified fields inherit the
+            -- global debounce/throttle; Minuet provides no language presets.
+            filetype = {
+                lua = { debounce = 700, throttle = 1200 },
+                markdown = { debounce = 1600, throttle = 2500 },
+            },
+        },
+        quality = {
+            undo_window = 10000,
+            max_pending_undo = 64,
+            repeat_suppression = {
+                enabled = true,
+                ttl = 30000,
+                max_entries = 128,
+            },
+        },
+        provider_options = {
+            openai_compatible = {
+                model = 'deepseek-v4-flash',
+                end_point = 'https://api.deepseek.com/chat/completions',
+                api_key = 'DEEPSEEK_API_KEY',
+                name = 'Deepseek',
+                optional = {
+                    thinking = { type = 'disabled' },
+                },
+            },
+        },
+    },
+}
+```
+
+To collect a cross-session quality cohort, enable the allowlisted JSONL logger
+with a new dedicated file. Do not mix test, smoke, or synthetic records into a
+real-workflow cohort:
+
+```lua
+local quality_log = vim.fs.joinpath(vim.fn.stdpath 'state', 'minuet', 'cursor-tab-quality.jsonl')
+
+require('minuet').setup {
+    metrics = {
+        jsonl = {
+            enabled = true,
+            path = quality_log,
+        },
+    },
+    duet = {
+        auto_trigger = {
+            enabled = true,
+        },
+    },
+}
+```
+
+Run `:Minuet report` periodically. A visible suggestion is counted once per
+Duet cycle, and the report includes accepted, reverted, dismissed, stale,
+filtered, unresolved, parse-failed, request-outcome, and P50/P95 latency totals.
+The JSONL records contain only allowlisted enums, IDs, counters, and timings;
+they do not contain source text, prompts, responses, paths, identifiers,
+diagnostics, filetypes, headers, endpoints, or credentials. Files are created
+with private permissions where supported, stay local, and are never uploaded.
+Enabling JSONL alone does not trigger provider requests; automatic Duet remains
+a separate opt-in.
+
+Use a different exact path for every baseline or variant cohort. After closing
+Neovim, delete the configured cohort with `vim.fn.delete(quality_log)` from a
+trusted Neovim session, or remove that exact file with your normal file manager.
+Do not mix test, smoke, benchmark, or synthetic records into it.
+
+Minuet does not create a `<Tab>` mapping. To accept either a visible Duet or
+Virtual Text suggestion and otherwise insert Tab, add an expression mapping:
+
+```lua
+vim.keymap.set('i', '<Tab>', function()
+    return require('minuet.tab').accept_or_fallback()
+end, { expr = true, replace_keycodes = true, desc = 'Minuet accept or Tab' })
+```
+
+Users with an existing completion, snippet, or indentation chain should keep
+that behavior in the fallback function:
+
+```lua
+vim.keymap.set('i', '<Tab>', function()
+    return require('minuet.tab').accept_or_fallback(function()
+        -- Run your existing completion/snippet logic here and return its keys.
+        return '<Tab>'
+    end)
+end, { expr = true, replace_keycodes = true, desc = 'Minuet accept or fallback' })
+```
+
+The single-suggestion controller covers only Minuet Virtual Text and Duet.
+cmp, Blink, LSP completion, and LSP inline completion keep their own UI and Tab
+behavior.
 
 ## Recent Edits
 
@@ -1502,9 +1691,18 @@ carries the session's edit history.
 To prevent sensitive buffers from being tracked in the edit history, configure
 `recent_edits.enable_predicates` with a list of functions, each receiving a
 buffer number. A buffer is only tracked while all predicates return true. If a
-buffer is rejected, it is never snapshotted to disk. By default, the list
-rejects dotenv files (`.env`, `.env.*`). Because predicates run on every
-trackability check, ensure they are highly efficient.
+buffer is rejected, it is never snapshotted to disk. The default rejects binary
+buffers, dotenv files (`.env`, `.env.*`), `.netrc`, `.npmrc`, `.pypirc`, common
+credential basenames, SSH private-key basenames, and `.pem`, `.key`, `.p12`, or
+`.pfx` files. Because predicates run on every trackability check, ensure they
+are highly efficient.
+
+`auto_trigger.enable_predicates` has an independent copy of the same default
+guard. It protects only automatic Duet requests. Manual Duet, Virtual Text,
+cmp, Blink, and LSP requests still send the current context when explicitly
+triggered, so users must avoid invoking them in sensitive buffers. Replacing
+one predicate list does not replace the other, and neither list is a complete
+secret detector.
 
 Example:
 
@@ -1524,7 +1722,6 @@ recent_edits = {
 - [x] Implement a proper diff mechanism to include recent edit changes in prompts.
 - [ ] Add support for specialized NES models (Zeta, Sweep).
 - [ ] Integrate with Inception's hosted API.
-- [ ] Implement automatically triggered duet prediction.
 
 ## Default Config
 
@@ -1533,6 +1730,39 @@ require('minuet').setup {
     duet = {
         provider = 'gemini', -- Provider used by `:Minuet duet predict`.
         request_timeout = 15, -- Timeout in seconds for a single duet request.
+        scope = 'buffer', -- 'cursor', 'buffer', or 'workspace'; cross-buffer targets still require the separate flag below.
+        jump_requires_confirmation = true, -- Require one action to focus a remote edit and a second action to apply it.
+        candidates = {
+            cursor = true, -- Include the current cursor as a candidate.
+            recent_edits = true, -- Include current-buffer unified diff hunk rows from bounded recent edit history.
+            diagnostics = true, -- Include rows from Neovim's diagnostic cache without making LSP requests.
+            references = true, -- Query supported attached LSP clients for same-buffer references to recently changed identifiers.
+            text = true, -- Include bounded same-buffer identifier matches without an LSP.
+            related_buffers = false, -- With scope='workspace', allow safe loaded same-workspace LSP references as targets.
+            max_candidates = 8, -- Maximum ranked candidates retained internally (clamped to 1..64).
+        },
+        lsp = {
+            timeout = 120, -- Total asynchronous semantic deadline in milliseconds; 0 disables LSP requests.
+            cache_ttl = 30000, -- Reuse semantic results only for the same buffer changedtick and config.
+            max_cache_buffers = 32,
+            max_identifiers = 8,
+            max_symbol_queries = 4,
+            max_symbols = 128,
+            max_locations = 64,
+            max_text_matches_per_identifier = 8,
+        },
+        context = {
+            max_chars = 48000, -- Total bounded current request context; an oversized editable region is rejected.
+            evidence_max_chars = 4800,
+            diagnostic_radius = 20,
+            max_diagnostics = 12,
+            related_files = {
+                enabled = false, -- Opt in before sending source from directly imported, already loaded buffers.
+                max_chars = 12000,
+                max_files = 3,
+                per_file_max_chars = 4000,
+            },
+        },
         editable_region = {
             lines_before = 8, -- Number of editable lines included before the cursor.
             lines_after = 15, -- Number of editable lines included after the cursor.
@@ -1543,6 +1773,27 @@ require('minuet').setup {
             context_window = 40000, -- Maximum characters of non-editable context included around the editable region.
             context_ratio = 0.75, -- Ratio of non-editable context before vs. after the editable region when truncation is needed.
         },
+        auto_trigger = {
+            enabled = false, -- Opt in to automatic Duet requests after eligible edits.
+            debounce = 900, -- Milliseconds of idle time before an automatic prediction.
+            throttle = 1500, -- Minimum milliseconds between automatic Duet request starts.
+            on_insert_leave = true, -- Run a pending dirty generation after leaving Insert mode.
+            after_accept = true, -- Schedule another prediction after accepting FIM or Duet.
+            max_buffer_size = 1000000, -- Buffers larger than this (bytes) do not trigger automatically.
+            enable_predicates = { ... }, -- Cheap per-buffer guards. Defaults reject binary and common credential paths; overriding replaces only this list.
+            filetype = {}, -- Optional { [filetype] = { debounce = ms, throttle = ms } }; missing fields inherit global values.
+        },
+        quality = {
+            undo_window = 10000, -- Count an accepted suggestion as reverted only when undo crosses it within this many milliseconds.
+            max_pending_undo = 64, -- Global bound for accepted suggestions awaiting undo observation.
+            repeat_suppression = {
+                enabled = true, -- Suppress an identical edit fingerprint in the same unchanged context.
+                ttl = 30000, -- Milliseconds before an in-memory fingerprint expires.
+                max_entries = 128, -- Global bound for SHA-256 fingerprints; source text is not retained.
+            },
+        },
+        max_edit_lines = 40, -- Reject a prediction whose diff changes more than this many lines.
+        max_edit_chars = 12000, -- Reject a prediction whose proposed editable region exceeds this byte count.
         recent_edits = {
             enabled = 'lazy', -- 'lazy' starts the recorder on the first duet prediction, true starts it at plugin setup, false disables it entirely
             debounce = 1500, -- Milliseconds of typing pause before an edit burst is recorded as one event.
@@ -1553,7 +1804,7 @@ require('minuet').setup {
             max_event_chars = 2000, -- A single edit burst whose diff exceeds this is truncated to the leading whole hunks that fit (dropped if not even the first hunk fits).
             diff_program = 'diff', -- External diff program invoked as `PROG -U<n> OLD NEW`; must emit unified diffs and exit 0 (identical) / 1 (differences) / >= 2 (error).
             flush_timeout = 200, -- Max milliseconds a prediction waits for in-flight diffs before proceeding with slightly stale history.
-            enable_predicates = { ... }, -- Per-buffer predicates called with a buffer number; a buffer is tracked only while all return true. Defaults to rejecting dotenv files (.env, .env.*); overriding replaces that default.
+            enable_predicates = { ... }, -- Per-buffer predicates called with a buffer number; defaults reject binary and common credential paths. This list is independent from auto_trigger.enable_predicates.
         },
         markers = {
             editable_region_start = '<editable_region>', -- Marker that wraps the start of the editable region in prompts and responses.
@@ -1562,6 +1813,9 @@ require('minuet').setup {
         },
         preview = {
             cursor = '', -- Virtual marker shown at the predicted cursor location in the preview.
+            jump_text = 'Next edit: line %d', -- Origin hint for a remote edit; must contain one integer placeholder.
+            cross_jump_text = 'Next edit: %s:%d', -- Workspace-relative path and line hint for an opted-in cross-buffer edit.
+            jump_sign = '>>', -- One- or two-cell target sign for a remote edit.
         },
         provider_options = {
             openai = {
@@ -1647,6 +1901,86 @@ The duet module provides functions to programmatically control duet prediction:
 }
 ```
 
+Candidate discovery can also be inspected programmatically. It only returns
+positions, numeric scores, and source enums for the current loaded, modifiable
+buffer; diagnostic messages and recent diff bodies are not retained in the
+returned metadata:
+
+```lua
+local candidates = require 'minuet.duet.candidates'
+
+local ranked = candidates.collect(vim.api.nvim_get_current_buf())
+local best = candidates.select(vim.api.nvim_get_current_buf())
+```
+
+## Unified Tab
+
+The Tab module arbitrates only visible Minuet Virtual Text and Duet
+suggestions. It never installs a mapping:
+
+```lua
+{
+    -- Returns true when Minuet handled the current visible suggestion.
+    require('minuet.tab').accept,
+    -- Returns '' when handled; otherwise invokes/returns the supplied fallback.
+    require('minuet.tab').accept_or_fallback,
+}
+```
+
+`accept_or_fallback()` accepts a string or a function returning a string. With
+no argument it returns `'<Tab>'` when Minuet has nothing to accept. See
+[Automatic Prediction and Tab](#automatic-prediction-and-tab) for expression
+mapping examples.
+
+## Session Metrics
+
+Use the metrics API to retrieve a deep-copied snapshot for the current Neovim
+process:
+
+```lua
+local stats = require('minuet.metrics').get()
+
+print(stats.channels.completion.requests.outcomes.success)
+print(stats.channels.duet.cycles.preview_shown)
+print(stats.channels.duet.visible_acceptance_rate)
+```
+
+The snapshot contains aggregate counts and bounded P50/P95/max latency data. A
+zero preview denominator produces `nil`, rather than a misleading zero percent
+acceptance rate. It never includes source text, prompts, responses, paths,
+endpoints, headers, or credentials.
+
+The optional JSONL logger uses an allowlist of scalar lifecycle fields, a
+bounded asynchronous queue, private directory/file permissions where supported,
+and is disabled by default. It writes only to the configured local path and
+never uploads metrics.
+
+## Offline Quality Report
+
+The report API reads allowlisted JSONL records without changing session
+metrics or contacting a provider:
+
+```lua
+local quality = require 'minuet.metrics_report'
+local report = quality.analyze() -- Optional string or list of paths/globs.
+local message = quality.format(report)
+
+quality.notify() -- Analyze and show the same privacy-preserving summary.
+
+local comparison = quality.compare('/exact/baseline.jsonl', '/exact/variant.jsonl')
+print(comparison.delta.acceptance_rate)
+```
+
+`report.gate.ready_for_review` requires at least 100 unique visible Duet cycles
+and clean structural integrity checks. It is deliberately named "ready for
+review": the caller must still confirm that all inputs came from real editing
+sessions. `report.release_gate.ready_for_release_review` additionally requires
+500 visible cycles, Next Edit P50/P95 under 1500/4000 ms, acceptance of at least
+25%, accepted-undo below 10%, parse failure below 2%, and clean integrity. It
+still requires manual provenance, FIM latency, stale-application, wrong-buffer,
+and safety review. The returned aggregate contains no source, prompt, response,
+input path, endpoint, header, or credential fields.
+
 ## Lualine
 
 Minuet provides a Lualine component that displays the current status of Minuet requests. This component shows:
@@ -1701,6 +2035,17 @@ require('lualine').setup {
   is dispatched.
 - **MinuetDuetRequestFinished**: Triggered upon completion of the duet request.
 
+### Suggestion Lifecycle
+
+`MinuetSuggestionLifecycle` is emitted for UI lifecycle changes controlled by
+Minuet. Its `kind` is one of `preview_shown`, `accepted`, `dismissed`, `stale`,
+or `parse_failed`. The event currently covers only the virtual text and Duet
+frontends.
+
+The payload is allowlisted and includes `schema_version`, `kind`, `channel`,
+`cycle_id`, `provider_id`, `frontend`, `timestamp`, `elapsed_ms`, and an optional
+classified `reason`. It does not contain suggestion or provider response text.
+
 ### Event Data
 
 Each event includes a `data` field containing the following properties:
@@ -1715,6 +2060,20 @@ Each event includes a `data` field containing the following properties:
   providers make multiple requests.
 - `timestamp`: A Unix timestamp representing the start of the request cycle
   (corresponding to the `MinuetRequestStartedPre` event).
+- `schema_version`: The event schema version, currently `1`.
+- `channel`: Either `completion` or `duet`.
+- `cycle_id`: The strictly increasing ID of the frontend's logical provider
+  call.
+- `request_id` (started/finished only): The strictly increasing transport
+  request ID.
+- `provider_id`: The configured provider key.
+- `frontend`: The Minuet frontend that created the cycle, when known.
+- `duration_ms` (finished only): Monotonic transport duration for a successfully
+  spawned request.
+- `status` (finished only): One of `success`, `partial`, `timeout`, `cancelled`,
+  `transport_error`, `invalid_response`, `empty_response`, or `spawn_error`.
+- `reason` (finished only): An optional fixed classification. Raw errors and
+  provider responses are never included.
 
 # FAQ
 
@@ -2016,6 +2375,28 @@ If your setup failed, there are two most likely reasons:
    - Set a longer request timeout (e.g., `config.request_timeout = 5`)
 
 To diagnose issues, set `config.notify = debug` and examine the output.
+
+For Duet and Cursor Tab specifically:
+
+- No preview can mean the response was a no-op, whitespace-only, oversized, or
+  a repeated fingerprint. It can also mean the Buffer changed before the
+  response arrived. Check `:Minuet stats` or the aggregate `:Minuet report`;
+  neither command exposes response text.
+- LSP reference lookup is bounded by `duet.lsp.timeout`. A timeout falls back to
+  other enabled candidate sources and does not make the current Buffer unsafe.
+- A stale count means context, ownership, or a Buffer anchor changed. Stale
+  suggestions are fenced and are not applied.
+- Cross-buffer targets require both `duet.scope = 'workspace'` and
+  `duet.candidates.related_buffers = true`. The target must already be loaded,
+  listed, modifiable, LSP-referenced, and inside the same workspace.
+- If JSONL is unwritable or reaches `metrics.jsonl.max_file_size`, collection is
+  disabled for that session without interrupting editing. Use a writable exact
+  path with space available, then restart Neovim; do not merge partial logs
+  until their integrity passes `:Minuet report`.
+
+Automatic Duet and cross-buffer edits remain disabled by default. Keep them
+opt-in until a real 500-visible cohort and the manual provenance and safety
+review are complete.
 
 # Contributing
 

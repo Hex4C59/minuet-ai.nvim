@@ -1,5 +1,8 @@
 local M = {}
 
+local uv = vim.uv or vim.loop
+local event_error_notified = false
+
 function M.replace_string_literal(text, needle, replacement)
     local result = {}
     local start_index = 1
@@ -51,27 +54,106 @@ function M.get_api_key(env_var)
     return api_key
 end
 
--- referenced from cmp_ai
-function M.make_tmp_file(content)
-    local tmp_file = os.tmpname()
+---@class minuet.TempFileLease
+---@field path string
+---@field remaining integer
+---@field deleted boolean
+---@field release fun(self: minuet.TempFileLease): boolean
+---@field discard fun(self: minuet.TempFileLease): boolean
 
-    local f = io.open(tmp_file, 'w+')
-    if f == nil then
-        M.notify('Cannot open temporary message file: ' .. tmp_file, 'error', vim.log.levels.ERROR)
-        return
+---@param path string
+local function remove_tmp_file(path)
+    local ok, removed = pcall(uv.fs_unlink, path)
+    if not ok or not removed then
+        pcall(os.remove, path)
     end
+end
 
-    local result, json = pcall(vim.json.encode, content)
-
-    if not result then
+-- referenced from cmp_ai
+---@param content any
+---@param refcount? integer
+---@return string? path
+---@return minuet.TempFileLease? lease
+function M.make_tmp_file(content, refcount)
+    local encoded, json = pcall(vim.json.encode, content)
+    if not encoded or type(json) ~= 'string' then
         M.notify('Failed to encode completion request data', 'error', vim.log.levels.ERROR)
         return
     end
 
-    f:write(json)
-    f:close()
+    local named, tmp_file = pcall(vim.fn.tempname)
+    if not named or type(tmp_file) ~= 'string' or tmp_file == '' then
+        M.notify('Cannot create temporary request file.', 'error', vim.log.levels.ERROR)
+        return
+    end
 
-    return tmp_file
+    local opened, fd = pcall(uv.fs_open, tmp_file, 'wx', 384)
+    if not opened or type(fd) ~= 'number' then
+        M.notify('Cannot create temporary request file.', 'error', vim.log.levels.ERROR)
+        return
+    end
+
+    if uv.fs_fchmod then
+        pcall(uv.fs_fchmod, fd, 384)
+    elseif uv.fs_chmod then
+        pcall(uv.fs_chmod, tmp_file, 384)
+    end
+
+    local offset = 0
+    while offset < #json do
+        local wrote, bytes_written = pcall(uv.fs_write, fd, json:sub(offset + 1), offset)
+        if not wrote or type(bytes_written) ~= 'number' or bytes_written <= 0 then
+            pcall(uv.fs_close, fd)
+            remove_tmp_file(tmp_file)
+            M.notify('Failed to write temporary request file.', 'error', vim.log.levels.ERROR)
+            return
+        end
+        offset = offset + bytes_written
+    end
+
+    local closed, close_result = pcall(uv.fs_close, fd)
+    if not closed or not close_result then
+        pcall(uv.fs_close, fd)
+        remove_tmp_file(tmp_file)
+        M.notify('Failed to close temporary request file.', 'error', vim.log.levels.ERROR)
+        return
+    end
+
+    refcount = type(refcount) == 'number' and math.floor(refcount) or 1
+    refcount = math.max(refcount, 1)
+
+    ---@type minuet.TempFileLease
+    local lease = {
+        path = tmp_file,
+        remaining = refcount,
+        deleted = false,
+    }
+
+    function lease:release()
+        if self.remaining <= 0 then
+            return false
+        end
+
+        self.remaining = self.remaining - 1
+        if self.remaining == 0 and not self.deleted then
+            self.deleted = true
+            remove_tmp_file(self.path)
+        end
+        return true
+    end
+
+    function lease:discard()
+        if self.deleted then
+            return false
+        end
+
+        self.remaining = 0
+        self.deleted = true
+        remove_tmp_file(self.path)
+        return true
+    end
+
+    return tmp_file, lease
 end
 
 function M.make_system_prompt(template, n_completion)
@@ -531,109 +613,193 @@ function M.make_chat_llm_shot(context, template)
     return results
 end
 
----@param response vim.SystemCompleted
-function M.no_stream_decode(response, data_file, provider, get_text_fn)
-    os.remove(data_file)
+---@class minuet.DecodeResult
+---@field text? string
+---@field status 'success'|'partial'|'timeout'|'transport_error'|'invalid_response'|'empty_response'
+---@field reason? 'timeout'|'transport_error'|'invalid_json'|'extractor_error'|'empty_response'
 
-    if response.code ~= 0 then
-        if response.code == 28 then
-            M.notify('Request timed out.', 'warn', vim.log.levels.WARN)
+---@param result minuet.DecodeResult
+local function notify_decode_result(result)
+    if result.status == 'timeout' then
+        M.notify('Request timed out.', 'warn', vim.log.levels.WARN)
+    elseif result.status == 'transport_error' then
+        M.notify('Request failed because of a transport error.', 'error', vim.log.levels.ERROR)
+    elseif result.status == 'invalid_response' then
+        if result.reason == 'invalid_json' then
+            M.notify('Minuet provider response is not valid JSON.', 'error', vim.log.levels.INFO)
         else
-            M.notify(string.format('Request failed with exit code %d', response.code), 'error', vim.log.levels.ERROR)
+            M.notify('Minuet provider response could not be decoded.', 'error', vim.log.levels.INFO)
         end
-        return
+    elseif result.status == 'empty_response' then
+        M.notify('Minuet provider returned no completion text.', 'verbose', vim.log.levels.INFO)
+    end
+end
+
+---@param result minuet.DecodeResult
+---@param data_file? string
+---@param structured boolean
+---@return minuet.DecodeResult|string?
+local function return_decode_result(result, data_file, structured)
+    if structured then
+        return result
     end
 
-    local result = response.stdout or ''
-    local success, json = pcall(vim.json.decode, result)
-    if not success then
-        if result ~= '' then
-            M.notify(
-                'Failed to parse ' .. provider .. ' API response as json: ' .. vim.inspect(result),
-                'error',
-                vim.log.levels.INFO
-            )
-        end
-        return
+    if type(data_file) == 'string' and data_file ~= '' then
+        remove_tmp_file(data_file)
     end
-
-    local result_str
-
-    success, result_str = pcall(get_text_fn, json)
-
-    if not success or type(result_str) ~= 'string' or result_str == '' then
-        if result:find 'error' then
-            M.notify(provider .. ' returns error: ' .. vim.inspect(result), 'error', vim.log.levels.INFO)
-        else
-            M.notify(provider .. ' returns no text: ' .. vim.inspect(json), 'verbose', vim.log.levels.INFO)
-        end
-        return
-    end
-
-    return result_str
+    return result.text
 end
 
 ---@param response vim.SystemCompleted
-function M.stream_decode(response, data_file, provider, get_text_fn)
-    os.remove(data_file)
-
-    if not (response.code == 28 or response.code == 0) then
-        M.notify(string.format('Request failed with exit code %d', response.code), 'error', vim.log.levels.ERROR)
-        return
+---@param data_file? string Kept for compatibility; the owning lease removes the file in structured mode.
+---@param _provider? string
+---@param get_text_fn fun(json: any): any
+---@param opts? { notify?: boolean }
+---@return minuet.DecodeResult|string?
+function M.no_stream_decode(response, data_file, _provider, get_text_fn, opts)
+    local structured = opts ~= nil
+    local should_notify = not opts or opts.notify ~= false
+    local code = type(response) == 'table' and response.code or nil
+    if code == 28 then
+        local decoded = { status = 'timeout', reason = 'timeout' }
+        if should_notify then
+            notify_decode_result(decoded)
+        end
+        return return_decode_result(decoded, data_file, structured)
+    elseif code ~= 0 then
+        local decoded = { status = 'transport_error', reason = 'transport_error' }
+        if should_notify then
+            notify_decode_result(decoded)
+        end
+        return return_decode_result(decoded, data_file, structured)
     end
 
-    local result = {}
-    local responses = vim.split(response.stdout or '', '\n', { plain = true, trimempty = false })
-
-    for _, line in ipairs(responses) do
-        local success, json, text
-
-        line = line:gsub('^data:', '')
-        success, json = pcall(vim.json.decode, line)
-        if not success then
-            goto continue
+    local stdout = type(response.stdout) == 'string' and response.stdout or ''
+    if stdout == '' then
+        local decoded = { status = 'empty_response', reason = 'empty_response' }
+        if should_notify then
+            notify_decode_result(decoded)
         end
-
-        success, text = pcall(get_text_fn, json)
-        if not success then
-            goto continue
-        end
-
-        if type(text) == 'string' and text ~= '' then
-            table.insert(result, text)
-        end
-        ::continue::
+        return return_decode_result(decoded, data_file, structured)
     end
 
-    local result_str = #result > 0 and table.concat(result) or nil
+    local success, json = pcall(vim.json.decode, stdout)
+    if not success then
+        local decoded = { status = 'invalid_response', reason = 'invalid_json' }
+        if should_notify then
+            notify_decode_result(decoded)
+        end
+        return return_decode_result(decoded, data_file, structured)
+    end
 
-    if not result_str then
-        local notified_on_error = false
-        for _, line in ipairs(responses) do
-            if line:find 'error' then
-                M.notify(
-                    provider .. ' returns error on streaming: ' .. vim.inspect(responses),
-                    'error',
-                    vim.log.levels.INFO
-                )
+    local extracted, text = pcall(get_text_fn, json)
+    if not extracted then
+        local decoded = { status = 'invalid_response', reason = 'extractor_error' }
+        if should_notify then
+            notify_decode_result(decoded)
+        end
+        return return_decode_result(decoded, data_file, structured)
+    elseif type(text) ~= 'string' or text == '' then
+        local decoded = { status = 'empty_response', reason = 'empty_response' }
+        if should_notify then
+            notify_decode_result(decoded)
+        end
+        return return_decode_result(decoded, data_file, structured)
+    end
 
-                notified_on_error = true
+    return return_decode_result({ text = text, status = 'success' }, data_file, structured)
+end
 
-                break
+---@param response vim.SystemCompleted
+---@param data_file? string Kept for compatibility; the owning lease removes the file in structured mode.
+---@param _provider? string
+---@param get_text_fn fun(json: any): any
+---@param opts? { notify?: boolean }
+---@return minuet.DecodeResult|string?
+function M.stream_decode(response, data_file, _provider, get_text_fn, opts)
+    local structured = opts ~= nil
+    local should_notify = not opts or opts.notify ~= false
+    local code = type(response) == 'table' and response.code or nil
+    if code ~= 0 and code ~= 28 then
+        local decoded = { status = 'transport_error', reason = 'transport_error' }
+        if should_notify then
+            notify_decode_result(decoded)
+        end
+        return return_decode_result(decoded, data_file, structured)
+    end
+
+    local stdout = type(response.stdout) == 'string' and response.stdout or ''
+    local text_parts = {}
+    local saw_payload = false
+    local saw_invalid_json = false
+    local saw_extractor_error = false
+
+    for line in (stdout .. '\n'):gmatch '(.-)\n' do
+        line = line:gsub('\r$', '')
+        local payload = line
+        if line:sub(1, 5) == 'data:' then
+            payload = line:sub(6):gsub('^%s+', '')
+        elseif
+            line == ''
+            or line:sub(1, 1) == ':'
+            or line:match '^event:%s*'
+            or line:match '^id:%s*'
+            or line:match '^retry:%s*'
+        then
+            payload = ''
+        end
+
+        if payload ~= '' and payload ~= '[DONE]' then
+            saw_payload = true
+            local decoded, json = pcall(vim.json.decode, payload)
+            if not decoded then
+                saw_invalid_json = true
+            else
+                local extracted, text = pcall(get_text_fn, json)
+                if not extracted then
+                    saw_extractor_error = true
+                elseif type(text) == 'string' and text ~= '' then
+                    table.insert(text_parts, text)
+                end
             end
         end
-
-        if not notified_on_error then
-            M.notify(
-                provider .. ' returns no text on streaming: ' .. vim.inspect(responses),
-                'verbose',
-                vim.log.levels.INFO
-            )
-        end
-        return
     end
 
-    return result_str
+    if #text_parts > 0 then
+        local status = code == 28 and 'partial' or 'success'
+        return return_decode_result({
+            text = table.concat(text_parts),
+            status = status,
+            reason = code == 28 and 'timeout' or nil,
+        }, data_file, structured)
+    elseif code == 28 then
+        local decoded = { status = 'timeout', reason = 'timeout' }
+        if should_notify then
+            notify_decode_result(decoded)
+        end
+        return return_decode_result(decoded, data_file, structured)
+    elseif saw_extractor_error then
+        local decoded = { status = 'invalid_response', reason = 'extractor_error' }
+        if should_notify then
+            notify_decode_result(decoded)
+        end
+        return return_decode_result(decoded, data_file, structured)
+    elseif saw_invalid_json then
+        local decoded = { status = 'invalid_response', reason = 'invalid_json' }
+        if should_notify then
+            notify_decode_result(decoded)
+        end
+        return return_decode_result(decoded, data_file, structured)
+    end
+
+    local decoded = { status = 'empty_response', reason = 'empty_response' }
+    if not saw_payload then
+        decoded.reason = 'empty_response'
+    end
+    if should_notify then
+        notify_decode_result(decoded)
+    end
+    return return_decode_result(decoded, data_file, structured)
 end
 
 M.add_single_line_entry = function(list)
@@ -675,7 +841,23 @@ end
 ---@param opts minuet.EventData The minuet data event
 function M.run_event(event, opts)
     opts = opts or {}
-    vim.api.nvim_exec_autocmds('User', { pattern = event, data = opts })
+    local previous_errmsg = vim.v.errmsg
+    vim.v.errmsg = ''
+    local ok = pcall(vim.api.nvim_exec_autocmds, 'User', { pattern = event, data = opts })
+    local event_errmsg = vim.v.errmsg
+    vim.v.errmsg = previous_errmsg
+
+    if (not ok or event_errmsg ~= '') and not event_error_notified then
+        event_error_notified = true
+        local function notify()
+            pcall(vim.notify, 'Minuet could not dispatch a lifecycle event.', vim.log.levels.WARN)
+        end
+        if vim.in_fast_event and vim.in_fast_event() then
+            vim.schedule(notify)
+        else
+            notify()
+        end
+    end
 end
 
 ---@param end_point string

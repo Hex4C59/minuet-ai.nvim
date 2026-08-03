@@ -10,6 +10,9 @@ function M.openai_get_text_fn_stream(json)
     return json.choices[1].delta.content
 end
 
+---@param items string[]
+---@param context table
+---@return string[]
 local function prepare_fim_items(items, context)
     local filtered_items = common.filter_context_sequences_in_items(items, context)
     local non_empty_items = vim.tbl_filter(function(x)
@@ -18,213 +21,248 @@ local function prepare_fim_items(items, context)
     return non_empty_items
 end
 
-function M.complete_openai_base(options, context, callback)
+---@param options table
+---@param context table
+---@param callback fun(items?: string[])
+---@param lifecycle? minuet.BackendLifecycle
+function M.complete_openai_base(options, context, callback, lifecycle)
     local config = require('minuet').config
-
-    common.terminate_all_jobs()
-
-    local ctx = utils.make_chat_llm_shot(context, options.chat_input)
-    ctx = common.create_chat_messages_from_list(ctx)
-
-    local few_shots = vim.deepcopy(utils.get_or_eval_value(options.few_shots))
-
-    local system = utils.make_system_prompt(options.system, config.n_completions)
-
-    table.insert(few_shots, 1, { role = 'system', content = system })
-    vim.list_extend(few_shots, ctx)
-
-    local data = {
-        model = options.model,
-        messages = few_shots,
-        stream = options.stream,
-    }
-
-    data = vim.tbl_deep_extend('force', data, options.optional or {})
-
-    local headers = {
-        ['Content-Type'] = 'application/json',
-        ['Authorization'] = 'Bearer ' .. utils.get_api_key(options.api_key),
-    }
-    local transformed_data = common.apply_transforms(options.transform, options.end_point, headers, data)
-
-    local data_file = utils.make_tmp_file(transformed_data.body)
-
-    if data_file == nil then
-        return
-    end
-
-    local args = utils.make_curl_args(transformed_data.end_point, transformed_data.headers, data_file)
-
-    local provider_name = 'openai_compatible'
-    local timestamp = os.time()
-
-    utils.run_event('MinuetRequestStartedPre', {
-        provider = provider_name,
+    local metrics = require 'minuet.metrics'
+    local provider_id = options.provider_id or 'openai_compatible'
+    local provider = options.provider or 'openai_compatible'
+    local cycle_id = common.configure_cycle({
+        provider_id = provider_id,
+        provider = provider,
         name = options.name,
         model = options.model,
         n_requests = 1,
-        timestamp = timestamp,
-    })
+    }, lifecycle)
 
-    local new_job = common.start_job(config.curl_cmd, args, {
-        on_exit = function(_, result)
-            utils.run_event('MinuetRequestFinished', {
-                provider = provider_name,
-                model = options.model,
-                name = options.name,
-                n_requests = 1,
-                request_idx = 1,
-                timestamp = timestamp,
-            })
+    common.terminate_all_jobs()
 
-            local items_raw
+    local built, transformed_data = pcall(function()
+        local ctx = utils.make_chat_llm_shot(context, options.chat_input)
+        ctx = common.create_chat_messages_from_list(ctx)
 
+        local few_shots = vim.deepcopy(utils.get_or_eval_value(options.few_shots))
+        local system = utils.make_system_prompt(options.system, config.n_completions)
+
+        table.insert(few_shots, 1, { role = 'system', content = system })
+        vim.list_extend(few_shots, ctx)
+
+        local data = {
+            model = options.model,
+            messages = few_shots,
+            stream = options.stream,
+        }
+        data = vim.tbl_deep_extend('force', data, options.optional or {})
+
+        local headers = {
+            ['Content-Type'] = 'application/json',
+            ['Authorization'] = 'Bearer ' .. utils.get_api_key(options.api_key),
+        }
+        return common.apply_transforms(options.transform, options.end_point, headers, data)
+    end)
+
+    if not built or type(transformed_data) ~= 'table' then
+        utils.notify('Failed to build completion request.', 'error', vim.log.levels.ERROR)
+        callback()
+        return
+    end
+
+    local data_file, lease = utils.make_tmp_file(transformed_data.body, 1)
+    if not data_file or not lease then
+        callback()
+        return
+    end
+
+    local made_args, args = pcall(utils.make_curl_args, transformed_data.end_point, transformed_data.headers, data_file)
+    if not made_args then
+        lease:discard()
+        utils.notify('Failed to build completion request.', 'error', vim.log.levels.ERROR)
+        callback()
+        return
+    end
+
+    local request_id = metrics.request_attempted(cycle_id, 1)
+    local state = common.start_job(config.curl_cmd, args, {
+        cycle_id = cycle_id,
+        on_exit = function(job_state, result, ended_ns)
+            local decoded
             if options.stream then
-                items_raw = utils.stream_decode(result, data_file, options.name, M.openai_get_text_fn_stream)
+                decoded = utils.stream_decode(
+                    result,
+                    data_file,
+                    options.name,
+                    M.openai_get_text_fn_stream,
+                    { notify = not job_state.cancel_requested }
+                )
             else
-                items_raw = utils.no_stream_decode(result, data_file, options.name, M.openai_get_text_fn_no_stream)
+                decoded = utils.no_stream_decode(
+                    result,
+                    data_file,
+                    options.name,
+                    M.openai_get_text_fn_no_stream,
+                    { notify = not job_state.cancel_requested }
+                )
             end
 
-            if not items_raw then
+            local status = job_state.cancel_requested and 'cancelled' or decoded.status
+            local reason = job_state.cancel_requested and 'cancelled' or decoded.reason
+            metrics.request_finished(request_id, {
+                status = status,
+                reason = reason,
+                ended_ns = ended_ns,
+            })
+            lease:release()
+
+            if not decoded.text then
                 callback()
                 return
             end
 
-            local items = common.parse_completion_items(items_raw, options.name)
-
+            local items = common.parse_completion_items(decoded.text, options.name)
             items = common.filter_context_sequences_in_items(items, context)
-
             items = utils.trim_completion_items(items)
-
             callback(items)
         end,
-        on_spawn_error = function()
-            os.remove(data_file)
-            utils.run_event('MinuetRequestFinished', {
-                provider = provider_name,
-                model = options.model,
-                name = options.name,
-                n_requests = 1,
-                request_idx = 1,
-                timestamp = timestamp,
+        on_spawn_error = function(ended_ns)
+            metrics.request_finished(request_id, {
+                status = 'spawn_error',
+                reason = 'spawn_error',
+                ended_ns = ended_ns,
             })
+            lease:release()
             callback()
         end,
     })
 
-    if not new_job then
-        return
+    if state then
+        metrics.request_started(request_id)
     end
-
-    utils.run_event('MinuetRequestStarted', {
-        provider = provider_name,
-        name = options.name,
-        model = options.model,
-        n_requests = 1,
-        request_idx = 1,
-        timestamp = timestamp,
-    })
 end
 
-function M.complete_openai_fim_base(options, get_text_fn, context, callback)
+---@param options table
+---@param get_text_fn fun(json: any): any
+---@param context table
+---@param callback fun(items?: string[])
+---@param lifecycle? minuet.BackendLifecycle
+function M.complete_openai_fim_base(options, get_text_fn, context, callback, lifecycle)
     local config = require('minuet').config
-
-    common.terminate_all_jobs()
-
-    local data = {}
-
-    data.model = options.model
-    data.stream = options.stream
-    local context_before_cursor = context.lines_before
-    local context_after_cursor = context.lines_after
-    local opts = context.opts
-
-    data = vim.tbl_deep_extend('force', data, options.optional or {})
-
-    data.prompt = options.template.prompt(context_before_cursor, context_after_cursor, opts)
-    data.suffix = options.template.suffix and options.template.suffix(context_before_cursor, context_after_cursor, opts)
-        or nil
-
-    local end_point = options.end_point
-    local headers = {
-        ['Content-Type'] = 'application/json',
-        ['Accept'] = 'application/json',
-        ['Authorization'] = 'Bearer ' .. utils.get_api_key(options.api_key),
-    }
-
-    local transformed_data = common.apply_transforms(options.transform, end_point, headers, data)
-
-    local data_file = utils.make_tmp_file(transformed_data.body)
-
-    if data_file == nil then
-        return
-    end
-
-    local args = utils.make_curl_args(transformed_data.end_point, transformed_data.headers, data_file)
-
-    local items = {}
+    local metrics = require 'minuet.metrics'
     local n_completions = config.n_completions
-
-    local provider_name = 'openai_fim_compatible'
-    local timestamp = os.time()
-
-    utils.run_event('MinuetRequestStartedPre', {
-        provider = provider_name,
+    local provider_id = options.provider_id or 'openai_fim_compatible'
+    local provider = options.provider or 'openai_fim_compatible'
+    local cycle_id = common.configure_cycle({
+        provider_id = provider_id,
+        provider = provider,
         name = options.name,
         model = options.model,
         n_requests = n_completions,
-        timestamp = timestamp,
-    })
+    }, lifecycle)
 
+    common.terminate_all_jobs()
+
+    local built, transformed_data = pcall(function()
+        local context_before_cursor = context.lines_before
+        local context_after_cursor = context.lines_after
+        local opts = context.opts
+        local data = {
+            model = options.model,
+            stream = options.stream,
+        }
+        data = vim.tbl_deep_extend('force', data, options.optional or {})
+        data.prompt = options.template.prompt(context_before_cursor, context_after_cursor, opts)
+        data.suffix = options.template.suffix
+                and options.template.suffix(context_before_cursor, context_after_cursor, opts)
+            or nil
+
+        local headers = {
+            ['Content-Type'] = 'application/json',
+            ['Accept'] = 'application/json',
+            ['Authorization'] = 'Bearer ' .. utils.get_api_key(options.api_key),
+        }
+        return common.apply_transforms(options.transform, options.end_point, headers, data)
+    end)
+
+    if not built or type(transformed_data) ~= 'table' then
+        utils.notify('Failed to build completion request.', 'error', vim.log.levels.ERROR)
+        callback()
+        return
+    end
+
+    local data_file, lease = utils.make_tmp_file(transformed_data.body, n_completions)
+    if not data_file or not lease then
+        callback()
+        return
+    end
+
+    local made_args, args = pcall(utils.make_curl_args, transformed_data.end_point, transformed_data.headers, data_file)
+    if not made_args then
+        lease:discard()
+        utils.notify('Failed to build completion request.', 'error', vim.log.levels.ERROR)
+        callback()
+        return
+    end
+
+    if n_completions < 1 then
+        lease:discard()
+        return
+    end
+
+    local items = {}
     for idx = 1, n_completions do
-        local new_job = common.start_job(config.curl_cmd, args, {
-            on_exit = function(_, out)
-                utils.run_event('MinuetRequestFinished', {
-                    provider = provider_name,
-                    name = options.name,
-                    model = options.model,
-                    n_requests = n_completions,
-                    request_idx = idx,
-                    timestamp = timestamp,
-                })
-
-                local result
-
+        local request_idx = idx
+        local request_id = metrics.request_attempted(cycle_id, request_idx)
+        local state = common.start_job(config.curl_cmd, args, {
+            cycle_id = cycle_id,
+            on_exit = function(job_state, result, ended_ns)
+                local decoded
                 if options.stream then
-                    result = utils.stream_decode(out, data_file, options.name, get_text_fn)
+                    decoded = utils.stream_decode(
+                        result,
+                        data_file,
+                        options.name,
+                        get_text_fn,
+                        { notify = not job_state.cancel_requested }
+                    )
                 else
-                    result = utils.no_stream_decode(out, data_file, options.name, get_text_fn)
+                    decoded = utils.no_stream_decode(
+                        result,
+                        data_file,
+                        options.name,
+                        get_text_fn,
+                        { notify = not job_state.cancel_requested }
+                    )
                 end
 
-                if result then
-                    table.insert(items, result)
-                end
+                local status = job_state.cancel_requested and 'cancelled' or decoded.status
+                local reason = job_state.cancel_requested and 'cancelled' or decoded.reason
+                metrics.request_finished(request_id, {
+                    status = status,
+                    reason = reason,
+                    ended_ns = ended_ns,
+                })
+                lease:release()
 
+                if decoded.text then
+                    table.insert(items, decoded.text)
+                end
                 callback(prepare_fim_items(items, context))
             end,
-            on_spawn_error = function()
-                os.remove(data_file)
-                utils.run_event('MinuetRequestFinished', {
-                    provider = provider_name,
-                    name = options.name,
-                    model = options.model,
-                    n_requests = n_completions,
-                    request_idx = idx,
-                    timestamp = timestamp,
+            on_spawn_error = function(ended_ns)
+                metrics.request_finished(request_id, {
+                    status = 'spawn_error',
+                    reason = 'spawn_error',
+                    ended_ns = ended_ns,
                 })
+                lease:release()
                 callback(prepare_fim_items(items, context))
             end,
         })
 
-        if new_job then
-            utils.run_event('MinuetRequestStarted', {
-                provider = provider_name,
-                name = options.name,
-                model = options.model,
-                n_requests = n_completions,
-                request_idx = idx,
-                timestamp = timestamp,
-            })
+        if state then
+            metrics.request_started(request_id)
         end
     end
 end

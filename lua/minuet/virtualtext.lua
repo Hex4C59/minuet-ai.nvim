@@ -1,8 +1,9 @@
 -- referenced from copilot.lua https://github.com/zbirenbaum/copilot.lua
 local M = {}
 local utils = require 'minuet.utils'
+local metrics = require 'minuet.metrics'
+local controller = require 'minuet.suggestion'
 local api = vim.api
-local uv = vim.uv or vim.loop
 
 M.ns_id = api.nvim_create_namespace 'minuet.virtualtext'
 M.augroup = api.nvim_create_augroup('MinuetVirtualText', { clear = true })
@@ -17,9 +18,10 @@ local internal = {
     extmark_id = 1,
 
     timer = nil,
+    throttle_timer = nil,
     context = {},
     is_on_throttle = false,
-    current_completion_timestamp = 0,
+    current_request = nil,
 }
 
 local function should_auto_trigger()
@@ -71,9 +73,12 @@ local function get_ctx(bufnr)
     return ctx
 end
 
+---@param ctx? minuet.VirtualtextSuggestionContext
+---@param bufnr? integer
 ---@return string[]?
-local function get_last_typed_text(ctx)
+local function get_last_typed_text(ctx, bufnr)
     ctx = ctx or get_ctx()
+    bufnr = bufnr or api.nvim_get_current_buf()
     local last_typed = nil
     local last_pos = ctx.last_pos
     if not last_pos then
@@ -89,7 +94,7 @@ local function get_last_typed_text(ctx)
     local end_col = current_pos[2]
 
     if start_row < end_row or (start_row == end_row and start_col <= end_col) then
-        last_typed = api.nvim_buf_get_text(0, start_row, start_col, end_row, end_col, {})
+        last_typed = api.nvim_buf_get_text(bufnr, start_row, start_col, end_row, end_col, {})
     end
 
     return last_typed
@@ -99,7 +104,25 @@ end
 ---@field suggestions? string[]
 ---@field choice? integer
 ---@field shown_choices? table<string, true>
----@field last_pos integer[]
+---@field last_pos? integer[]
+---@field cycle_id? integer
+---@field pending_cycle_id? integer
+---@field dismissed_cycle_id? integer
+---@field request? minuet.VirtualtextRequest
+---@field lease? minuet.SuggestionLease
+
+---@class minuet.VirtualtextRequest
+---@field bufnr integer
+---@field cycle_id integer
+---@field has_result boolean
+---@field dismissed boolean
+---@field callback_seen boolean
+---@field consumed boolean
+---@field changedtick integer
+---@field cursor integer[]
+---@field original_line string
+---@field lease minuet.SuggestionLease
+---@field invalid_reason? 'superseded'|'context_changed'|'buffer_unloaded'
 
 ---@param ctx minuet.VirtualtextSuggestionContext
 local function reset_ctx(ctx)
@@ -107,18 +130,32 @@ local function reset_ctx(ctx)
     ctx.choice = nil
     ctx.shown_choices = nil
     ctx.last_pos = nil
+    ctx.cycle_id = nil
+    ctx.lease = nil
 end
 
 local function stop_timer()
-    if internal.timer and not internal.timer:is_closing() then
-        internal.timer:stop()
-        internal.timer:close()
-        internal.timer = nil
+    local timer = internal.timer
+    internal.timer = nil
+    if timer and not timer:is_closing() then
+        timer:stop()
+        timer:close()
     end
 end
 
-local function clear_preview()
-    api.nvim_buf_del_extmark(0, internal.ns_id, internal.extmark_id)
+local function stop_throttle_timer()
+    if internal.throttle_timer and not internal.throttle_timer:is_closing() then
+        internal.throttle_timer:stop()
+        internal.throttle_timer:close()
+    end
+    internal.throttle_timer = nil
+    internal.is_on_throttle = false
+end
+
+---@param bufnr? integer
+local function clear_preview(bufnr)
+    bufnr = bufnr or api.nvim_get_current_buf()
+    pcall(api.nvim_buf_del_extmark, bufnr, internal.ns_id, internal.extmark_id)
 end
 
 ---@param ctx? minuet.VirtualtextSuggestionContext
@@ -143,17 +180,26 @@ local function get_current_suggestion(ctx)
 end
 
 ---@param ctx? minuet.VirtualtextSuggestionContext
-local function update_preview(ctx)
+---@param bufnr? integer
+local function update_preview(ctx, bufnr)
     ctx = ctx or get_ctx()
+    bufnr = bufnr or api.nvim_get_current_buf()
 
     local suggestion = get_current_suggestion(ctx)
     local display_lines = suggestion and vim.split(suggestion, '\n', { plain = true }) or {}
 
-    clear_preview()
+    clear_preview(bufnr)
 
     local show_on_completion_menu = require('minuet').config.virtualtext.show_on_completion_menu
 
-    if not suggestion or #display_lines == 0 or (not show_on_completion_menu and completion_menu_visible()) then
+    if
+        bufnr ~= api.nvim_get_current_buf()
+        or not api.nvim_buf_is_loaded(bufnr)
+        or not suggestion
+        or #display_lines == 0
+        or not controller.is_current(ctx.lease)
+        or (not show_on_completion_menu and completion_menu_visible())
+    then
         return
     end
 
@@ -186,9 +232,23 @@ local function update_preview(ctx)
 
     extmark.hl_mode = 'replace'
 
-    api.nvim_buf_set_extmark(0, internal.ns_id, cursor_line - 1, cursor_col - 1, extmark)
+    api.nvim_buf_set_extmark(bufnr, internal.ns_id, cursor_line - 1, cursor_col - 1, extmark)
 
-    if not ctx.shown_choices[suggestion] then
+    if ctx.lease and ctx.lease.phase == 'pending' then
+        if not controller.mark_visible(ctx.lease) then
+            clear_preview(bufnr)
+            return
+        end
+    elseif not ctx.lease or (ctx.lease.phase ~= 'visible' and ctx.lease.phase ~= 'accepting') then
+        clear_preview(bufnr)
+        return
+    end
+
+    if ctx.cycle_id then
+        metrics.suggestion_event(ctx.cycle_id, 'preview_shown')
+    end
+
+    if ctx.shown_choices and not ctx.shown_choices[suggestion] then
         ctx.shown_choices[suggestion] = true
     end
 
@@ -196,11 +256,37 @@ local function update_preview(ctx)
 end
 
 ---@param ctx? minuet.VirtualtextSuggestionContext
-local function cleanup(ctx)
+---@param bufnr? integer
+---@param invalid_reason? 'superseded'|'context_changed'|'buffer_unloaded'
+local function cleanup(ctx, bufnr, invalid_reason)
     ctx = ctx or get_ctx()
+    bufnr = bufnr or api.nvim_get_current_buf()
     stop_timer()
+    local request = ctx.request
+    local lease = ctx.lease
+    if request and not request.dismissed and not request.consumed and invalid_reason then
+        request.invalid_reason = invalid_reason
+        if request.has_result then
+            metrics.suggestion_event(request.cycle_id, 'stale', invalid_reason)
+        end
+    end
+    if request then
+        require('minuet.backends.common').terminate_cycle(request.cycle_id)
+    end
+    if lease and controller.is_current(lease) then
+        if invalid_reason then
+            controller.finish(lease, 'stale', invalid_reason)
+        else
+            controller.release(lease)
+        end
+    end
     reset_ctx(ctx)
-    clear_preview()
+    ctx.pending_cycle_id = nil
+    ctx.request = nil
+    if internal.current_request == request then
+        internal.current_request = nil
+    end
+    clear_preview(bufnr)
 end
 
 ---@param ctx minuet.VirtualtextSuggestionContext
@@ -210,7 +296,8 @@ local function update_suggestion_on_typing(ctx)
         return false
     end
 
-    local last_typed_text = get_last_typed_text()
+    local bufnr = api.nvim_get_current_buf()
+    local last_typed_text = get_last_typed_text(ctx, bufnr)
     if not (last_typed_text and #last_typed_text > 0) then
         return false
     end
@@ -228,48 +315,212 @@ local function update_suggestion_on_typing(ctx)
         end
     end
 
-    update_preview(ctx)
+    update_preview(ctx, bufnr)
     stop_timer()
+
+    if ctx.suggestions[ctx.choice] == '' and ctx.request then
+        local request = ctx.request
+        local lease = ctx.lease
+        request.consumed = true
+        require('minuet.backends.common').terminate_cycle(request.cycle_id)
+        if lease then
+            controller.release(lease)
+        end
+        clear_preview(bufnr)
+        reset_ctx(ctx)
+        ctx.pending_cycle_id = nil
+        ctx.request = nil
+        if internal.current_request == request then
+            internal.current_request = nil
+        end
+    end
     return true
 end
 
-local function trigger(bufnr)
+local action = {}
+
+---@param bufnr integer
+---@param intent? minuet.SuggestionIntent
+---@return boolean started
+local function trigger(bufnr, intent)
+    intent = intent or 'auto'
     if bufnr ~= api.nvim_get_current_buf() or vim.fn.mode() ~= 'i' then
-        return
+        return false
+    end
+
+    local config = require('minuet').config
+    local loaded, provider = pcall(require, 'minuet.backends.' .. config.provider)
+    if not loaded then
+        utils.notify('Minuet completion provider is not supported.', 'error', vim.log.levels.ERROR)
+        return false
+    end
+
+    local changedtick = api.nvim_buf_get_changedtick(bufnr)
+    local cursor = api.nvim_win_get_cursor(0)
+    local original_line = api.nvim_buf_get_lines(bufnr, cursor[1] - 1, cursor[1], false)[1] or ''
+    local lease = controller.begin {
+        source = 'fim',
+        intent = intent,
+        bufnr = bufnr,
+        changedtick = changedtick,
+    }
+    if not lease then
+        return false
+    end
+
+    local built, completion_context = pcall(function()
+        return utils.get_context(utils.make_cmp_context())
+    end)
+    if not built then
+        controller.release(lease)
+        utils.notify('Failed to build completion context.', 'error', vim.log.levels.ERROR)
+        return false
     end
 
     utils.notify('Minuet virtual text started', 'verbose')
 
-    local config = require('minuet').config
+    local cycle_id = metrics.begin_cycle {
+        channel = 'completion',
+        frontend = 'virtualtext',
+        provider_id = config.provider,
+    }
+    ---@type minuet.VirtualtextRequest
+    local request = {
+        bufnr = bufnr,
+        cycle_id = cycle_id,
+        has_result = false,
+        dismissed = false,
+        callback_seen = false,
+        consumed = false,
+        changedtick = changedtick,
+        cursor = vim.deepcopy(cursor),
+        original_line = original_line,
+        lease = lease,
+    }
+    local ctx = get_ctx(bufnr)
+    clear_preview(bufnr)
+    reset_ctx(ctx)
+    ctx.pending_cycle_id = cycle_id
+    ctx.dismissed_cycle_id = nil
+    ctx.request = request
+    ctx.lease = lease
+    internal.current_request = request
+    lease.cycle_id = cycle_id
 
-    local context = utils.get_context(utils.make_cmp_context())
+    controller.attach(lease, {
+        cancel = function(reason)
+            if ctx.request ~= request or ctx.lease ~= lease then
+                return
+            end
+            request.invalid_reason = reason == 'buffer_unloaded' and 'buffer_unloaded'
+                or reason == 'buffer_changed' and 'context_changed'
+                or 'superseded'
+            cleanup(ctx, bufnr, request.invalid_reason)
+        end,
+        can_accept = function()
+            if
+                api.nvim_get_current_buf() ~= bufnr
+                or not api.nvim_buf_is_loaded(bufnr)
+                or ctx.request ~= request
+                or ctx.lease ~= lease
+                or not get_current_suggestion(ctx)
+            then
+                return false, 'context_changed'
+            end
+            local extmark = api.nvim_buf_get_extmark_by_id(bufnr, internal.ns_id, internal.extmark_id, {})
+            return extmark[1] ~= nil, 'context_changed'
+        end,
+        accept = function()
+            action.accept()
+        end,
+        dismiss = function(_, explicit)
+            if not explicit or ctx.request ~= request or ctx.lease ~= lease then
+                return
+            end
+            request.dismissed = true
+            ctx.dismissed_cycle_id = cycle_id
+            metrics.suggestion_event(cycle_id, 'dismissed')
+            require('minuet.duet.scheduler').dismissed(bufnr, api.nvim_buf_get_changedtick(bufnr))
+            cleanup(ctx, bufnr)
+        end,
+        is_visible = function()
+            if ctx.lease ~= lease or not api.nvim_buf_is_loaded(bufnr) then
+                return false
+            end
+            local extmark = api.nvim_buf_get_extmark_by_id(bufnr, internal.ns_id, internal.extmark_id, {})
+            return extmark[1] ~= nil
+        end,
+    })
 
-    local provider = require('minuet.backends.' .. config.provider)
-    local timestamp = uv.now()
-    internal.current_completion_timestamp = timestamp
+    local called = pcall(provider.complete, completion_context, function(data)
+        request.callback_seen = true
+        local has_data = data and next(data) ~= nil
+        if has_data then
+            request.has_result = true
+            metrics.cycle_has_result(cycle_id)
+        end
 
-    provider.complete(context, function(data)
-        if timestamp ~= internal.current_completion_timestamp then
-            if data and next(data) then
+        if
+            request.invalid_reason
+            or internal.current_request ~= request
+            or ctx.request ~= request
+            or ctx.lease ~= lease
+            or not controller.is_current(lease)
+        then
+            if has_data and not request.dismissed and not request.consumed then
                 -- Notify if outdated (and non-empty) completion items arrive
                 utils.notify('Completion items arrived, but too late, aborted', 'debug', 'info')
+                metrics.suggestion_event(cycle_id, 'stale', request.invalid_reason or 'superseded')
             end
             return
         end
 
+        if not api.nvim_buf_is_loaded(bufnr) then
+            request.invalid_reason = 'buffer_unloaded'
+            if has_data then
+                metrics.suggestion_event(cycle_id, 'stale', 'buffer_unloaded')
+            end
+            cleanup(ctx, bufnr, 'buffer_unloaded')
+            return
+        end
+        if
+            api.nvim_get_current_buf() ~= bufnr
+            or api.nvim_buf_get_changedtick(bufnr) ~= request.changedtick
+            or not vim.deep_equal(api.nvim_win_get_cursor(0), request.cursor)
+            or (api.nvim_buf_get_lines(bufnr, request.cursor[1] - 1, request.cursor[1], false)[1] or '')
+                ~= request.original_line
+        then
+            cleanup(ctx, bufnr, 'context_changed')
+            return
+        end
+
         data = utils.list_dedup(data or {})
-        local ctx = get_ctx()
 
         if next(data) then
+            request.consumed = false
             ctx.suggestions = data
+            ctx.cycle_id = cycle_id
             if not ctx.choice then
                 ctx.choice = 1
             end
             ctx.shown_choices = {}
         end
 
-        update_preview(ctx)
-    end)
+        update_preview(ctx, bufnr)
+        if not next(data) and not metrics.cycle_has_pending_requests(cycle_id) then
+            cleanup(ctx, bufnr)
+        end
+    end, {
+        cycle_id = cycle_id,
+        frontend = 'virtualtext',
+    })
+    if not called then
+        controller.release(lease)
+        cleanup(ctx, bufnr)
+        utils.notify('Failed to start completion request.', 'error', vim.log.levels.ERROR)
+        return false
+    end
+    return true
 end
 
 local function advance(count, ctx)
@@ -282,7 +533,7 @@ local function advance(count, ctx)
         ctx.choice = #ctx.suggestions
     end
 
-    update_preview(ctx)
+    update_preview(ctx, api.nvim_get_current_buf())
 end
 
 local function schedule()
@@ -295,11 +546,16 @@ local function schedule()
     local config = require('minuet').config
     local bufnr = api.nvim_get_current_buf()
 
-    internal.timer = vim.defer_fn(function()
+    local timer
+    timer = vim.defer_fn(function()
+        if internal.timer == timer then
+            internal.timer = nil
+        end
         local show_on_completion_menu = require('minuet').config.virtualtext.show_on_completion_menu
 
         if
-            internal.is_on_throttle
+            not should_auto_trigger()
+            or internal.is_on_throttle
             or (not show_on_completion_menu and completion_menu_visible())
             or (not utils.run_hooks_until_failure(config.enable_predicates))
         then
@@ -307,22 +563,22 @@ local function schedule()
         end
 
         internal.is_on_throttle = true
-        vim.defer_fn(function()
+        internal.throttle_timer = vim.defer_fn(function()
+            internal.throttle_timer = nil
             internal.is_on_throttle = false
         end, config.throttle)
 
-        trigger(bufnr)
+        trigger(bufnr, 'auto')
     end, config.debounce)
+    internal.timer = timer
 end
-
-local action = {}
 
 action.next = function()
     local ctx = get_ctx()
 
     -- no suggestion request yet
     if not ctx.suggestions then
-        trigger(api.nvim_get_current_buf())
+        trigger(api.nvim_get_current_buf(), 'manual')
         return
     end
 
@@ -334,7 +590,7 @@ action.prev = function()
 
     -- no suggestion request yet
     if not ctx.suggestions then
-        trigger(api.nvim_get_current_buf())
+        trigger(api.nvim_get_current_buf(), 'manual')
         return
     end
 
@@ -346,15 +602,22 @@ end
 ---If n_lines is provided, only the first n_lines of the suggestion are inserted.
 ---After insertion, moves the cursor to the end of the inserted text.
 function action.accept(n_lines)
+    local bufnr = api.nvim_get_current_buf()
     local ctx = get_ctx()
-
     local suggestion = get_current_suggestion(ctx)
-    if not suggestion then
-        return
+    local lease = ctx.lease
+    if not suggestion or not lease or not controller.is_current(lease) then
+        return false
     end
 
     local suggestions = vim.split(suggestion, '\n')
     local remaining_suggestions = {}
+    local cycle_id = ctx.cycle_id
+    local request = ctx.request
+    local changedtick = api.nvim_buf_get_changedtick(bufnr)
+    local cursor = api.nvim_win_get_cursor(0)
+    local line, col = cursor[1] - 1, cursor[2]
+    local original_line = api.nvim_buf_get_lines(bufnr, line, line + 1, false)[1] or ''
 
     if n_lines then
         -- NOTE: If the first line is an empty string (""), it indicates that
@@ -372,14 +635,7 @@ function action.accept(n_lines)
         suggestions = vim.list_slice(suggestions, 1, n_lines)
     end
 
-    if #remaining_suggestions <= 0 then
-        reset_ctx(ctx)
-    end
-
-    clear_preview()
-
-    local cursor = api.nvim_win_get_cursor(0)
-    local line, col = cursor[1] - 1, cursor[2]
+    clear_preview(bufnr)
 
     if vim.fn.pumvisible() == 1 then
         -- Accepting Minuet completion while the pum is open is temporary; when
@@ -390,15 +646,60 @@ function action.accept(n_lines)
     end
 
     vim.schedule(function()
-        api.nvim_buf_set_text(0, line, col, line, col, suggestions)
+        if
+            not api.nvim_buf_is_loaded(bufnr)
+            or api.nvim_get_current_buf() ~= bufnr
+            or not controller.is_current(lease)
+            or ctx.lease ~= lease
+            or api.nvim_buf_get_changedtick(bufnr) ~= changedtick
+            or not vim.deep_equal(api.nvim_win_get_cursor(0), cursor)
+            or (api.nvim_buf_get_lines(bufnr, line, line + 1, false)[1] or '') ~= original_line
+        then
+            cleanup(ctx, bufnr, api.nvim_buf_is_loaded(bufnr) and 'context_changed' or 'buffer_unloaded')
+            return
+        end
+
+        local ok = pcall(api.nvim_buf_set_text, bufnr, line, col, line, col, suggestions)
+        if not ok then
+            cleanup(ctx, bufnr, 'context_changed')
+            return
+        end
+        if request and request.cycle_id == cycle_id and #remaining_suggestions == 0 then
+            request.consumed = true
+        end
+        if request then
+            require('minuet.backends.common').terminate_cycle(request.cycle_id)
+        end
+        if cycle_id then
+            metrics.suggestion_event(cycle_id, 'accepted')
+        end
+
         local new_col = #suggestions[#suggestions]
         -- For single-line suggestions, adjust the column position by adding the
         -- current column offset
         if #suggestions == 1 then
             new_col = new_col + col
         end
-        api.nvim_win_set_cursor(0, { line + #suggestions, new_col })
+        if api.nvim_get_current_buf() == bufnr then
+            pcall(api.nvim_win_set_cursor, 0, { line + #suggestions, new_col })
+        end
+
+        if #remaining_suggestions == 0 then
+            if request then
+                request.consumed = true
+            end
+            controller.finish(lease, 'accepted')
+            clear_preview(bufnr)
+            reset_ctx(ctx)
+            ctx.pending_cycle_id = nil
+            ctx.request = nil
+            if internal.current_request == request then
+                internal.current_request = nil
+            end
+            require('minuet.duet.scheduler').after_accept(bufnr)
+        end
     end)
+    return true
 end
 
 function action.accept_n_lines()
@@ -428,15 +729,20 @@ end
 
 function action.dismiss()
     local ctx = get_ctx()
-    cleanup(ctx)
+    if ctx.lease then
+        return controller.dismiss(ctx.lease)
+    end
+    return false
 end
 
 function action.is_visible()
-    return not not api.nvim_buf_get_extmark_by_id(0, internal.ns_id, internal.extmark_id, { details = false })[1]
+    local bufnr = api.nvim_get_current_buf()
+    return not not api.nvim_buf_get_extmark_by_id(bufnr, internal.ns_id, internal.extmark_id, { details = false })[1]
 end
 
 function action.disable_auto_trigger()
     vim.b.minuet_virtual_text_auto_trigger = false
+    stop_timer()
     vim.notify('Minuet Virtual Text auto trigger disabled', vim.log.levels.INFO)
 end
 
@@ -447,6 +753,9 @@ end
 
 function action.toggle_auto_trigger()
     vim.b.minuet_virtual_text_auto_trigger = not should_auto_trigger()
+    if not should_auto_trigger() then
+        stop_timer()
+    end
     vim.notify(
         'Minuet Virtual Text auto trigger ' .. (should_auto_trigger() and 'enabled' or 'disabled'),
         vim.log.levels.INFO
@@ -458,12 +767,15 @@ M.action = action
 local autocmd = {}
 
 function autocmd.on_insert_leave()
-    cleanup()
+    local bufnr = api.nvim_get_current_buf()
+    cleanup(get_ctx(bufnr), bufnr, 'context_changed')
 end
 
-function autocmd.on_buf_leave()
-    if vim.fn.mode():match '^[iR]' then
-        autocmd.on_insert_leave()
+---@param info { buf: integer }
+function autocmd.on_buf_leave(info)
+    local ctx = internal.context[info.buf]
+    if ctx then
+        cleanup(ctx, info.buf, 'context_changed')
     end
 end
 
@@ -489,7 +801,8 @@ function autocmd.on_cursor_moved_i()
     -- we don't cleanup immediately if the completion has arrived but not
     -- display yet.
     if ctx.shown_choices and next(ctx.shown_choices) then
-        cleanup(ctx)
+        local bufnr = api.nvim_get_current_buf()
+        cleanup(ctx, bufnr, 'context_changed')
     end
     if should_auto_trigger() then
         schedule()
@@ -497,7 +810,8 @@ function autocmd.on_cursor_moved_i()
 end
 
 function autocmd.on_cursor_hold_i()
-    update_preview()
+    local bufnr = api.nvim_get_current_buf()
+    update_preview(get_ctx(bufnr), bufnr)
 end
 
 function autocmd.on_text_changed_p()
@@ -506,6 +820,10 @@ end
 
 ---@param info { buf: integer }
 function autocmd.on_buf_unload(info)
+    local ctx = internal.context[info.buf]
+    if ctx then
+        cleanup(ctx, info.buf, 'buffer_unloaded')
+    end
     internal.context[info.buf] = nil
 end
 
@@ -600,6 +918,12 @@ end
 function M.setup()
     local config = require('minuet').config
     api.nvim_clear_autocmds { group = M.augroup }
+    stop_throttle_timer()
+    for bufnr, ctx in pairs(internal.context) do
+        cleanup(ctx, bufnr, 'superseded')
+    end
+    internal.context = {}
+    internal.current_request = nil
 
     if #config.virtualtext.auto_trigger_ft > 0 then
         api.nvim_create_autocmd('FileType', {

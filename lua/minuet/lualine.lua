@@ -6,6 +6,8 @@ M.n_requests = 1
 M.n_finished_requests = 0
 M.provider = nil
 M.model = nil
+M.current_cycle_id = nil
+M.finished_request_ids = {}
 
 local default_options = {
     -- the symbols that are used to create spinner animation
@@ -41,19 +43,30 @@ function M:init(options)
         pattern = 'MinuetRequestStartedPre',
         group = group,
         callback = function(request)
-            local data = request.data
+            local data = request.data or {}
             self.processing = false
-            self.n_requests = data.n_requests
+            self.current_cycle_id = data.cycle_id
+            self.finished_request_ids = {}
+            self.n_requests = type(data.n_requests) == 'number' and data.n_requests > 0 and data.n_requests or 1
             self.n_finished_requests = 0
-            self.provider = data.name
-            self.model = data.model
+
+            local provider = type(data.name) == 'string' and data.name ~= '' and data.name or nil
+            provider = provider or (type(data.provider) == 'string' and data.provider ~= '' and data.provider or nil)
+            provider = provider
+                or (type(data.provider_id) == 'string' and data.provider_id ~= '' and data.provider_id or nil)
+            local model = type(data.model) == 'string' and data.model ~= '' and data.model or nil
+            local fallback = provider or model or 'Minuet'
+            self.provider = provider or fallback
+            self.model = model or fallback
 
             if self.options.display_name == 'model' then
                 self.display_name = self.model
             elseif self.options.display_name == 'provider' then
                 self.display_name = self.provider
+            elseif provider and model then
+                self.display_name = provider .. self.options.provider_model_separator .. model
             else
-                self.display_name = self.provider .. self.options.provider_model_separator .. self.model
+                self.display_name = fallback
             end
         end,
     })
@@ -61,7 +74,11 @@ function M:init(options)
     vim.api.nvim_create_autocmd({ 'User' }, {
         pattern = 'MinuetRequestStarted',
         group = group,
-        callback = function()
+        callback = function(request)
+            local data = request.data or {}
+            if data.cycle_id ~= nil and data.cycle_id ~= self.current_cycle_id then
+                return
+            end
             self.processing = true
         end,
     })
@@ -69,9 +86,20 @@ function M:init(options)
     vim.api.nvim_create_autocmd({ 'User' }, {
         pattern = 'MinuetRequestFinished',
         group = group,
-        callback = function()
+        callback = function(request)
+            local data = request.data or {}
+            if data.cycle_id ~= nil and data.cycle_id ~= self.current_cycle_id then
+                return
+            end
+            if data.request_id ~= nil then
+                if self.finished_request_ids[data.request_id] then
+                    return
+                end
+                self.finished_request_ids[data.request_id] = true
+            end
+
             self.n_finished_requests = self.n_finished_requests + 1
-            if self.n_finished_requests == self.n_requests then
+            if self.n_finished_requests >= self.n_requests then
                 self.processing = false
             end
         end,
@@ -82,7 +110,7 @@ end
 function M:update_status()
     if self.processing then
         self.spinner_index = (self.spinner_index % self.spinner_symbols_len) + 1
-        local request = self.display_name
+        local request = self.display_name or 'Minuet'
         if self.n_requests > 1 then
             request = request .. ' ' .. string.format('(%s/%s)', self.n_finished_requests + 1, self.n_requests)
         end

@@ -1,5 +1,6 @@
 local M = {}
 local utils = require 'minuet.utils'
+local metrics = require 'minuet.metrics'
 local cmp = require 'cmp'
 local lsp = require 'cmp.types.lsp'
 
@@ -67,8 +68,17 @@ function M:complete(ctx, callback)
         utils.notify('Minuet completion started', 'verbose')
 
         local provider = require('minuet.backends.' .. config.provider)
+        local cycle_id = metrics.begin_cycle {
+            channel = 'completion',
+            frontend = 'cmp',
+            provider_id = config.provider,
+        }
 
         provider.complete(context, function(data)
+            if data and next(data) then
+                metrics.cycle_has_result(cycle_id)
+            end
+
             if not data then
                 callback()
                 return
@@ -98,7 +108,10 @@ function M:complete(ctx, callback)
             callback {
                 items = items,
             }
-        end)
+        end, {
+            cycle_id = cycle_id,
+            frontend = 'cmp',
+        })
     end
 
     -- manual mode always complete immediately without debounce or throttle

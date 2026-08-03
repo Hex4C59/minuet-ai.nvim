@@ -3,6 +3,8 @@ local utils = require 'minuet.utils'
 
 local M = {}
 
+M.provider_id = 'openai_compatible'
+
 local notified_on_using_chat_endpoint = false
 
 M.is_available = function()
@@ -30,10 +32,12 @@ If you are using Ollama, you can simply set it to 'TERM'.]],
     )
 end
 
-M.complete = function(context, callback)
+M.complete = function(context, callback, lifecycle)
     local config = require('minuet').config
     local options = vim.deepcopy(config.provider_options.openai_compatible)
-    base.complete_openai_base(options, context, callback)
+    options.provider_id = M.provider_id
+    options.provider = 'openai_compatible'
+    base.complete_openai_base(options, context, callback, lifecycle)
 end
 
 return M

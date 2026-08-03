@@ -1,5 +1,4 @@
 local api = vim.api
-local utils = require 'minuet.duet.utils'
 local M = {}
 
 M.ns_id = api.nvim_create_namespace 'minuet.duet'
@@ -9,6 +8,7 @@ local default_highlights = {
     MinuetDuetDelete = 'DiffDelete',
     MinuetDuetComment = 'Comment',
     MinuetDuetCursor = 'IncSearch',
+    MinuetDuetJump = 'DiagnosticInfo',
 }
 
 for hl_group, default_link in pairs(default_highlights) do
@@ -17,48 +17,28 @@ for hl_group, default_link in pairs(default_highlights) do
     end
 end
 
----@diagnostic disable-next-line: deprecated
-local diff = (vim.text and vim.text.diff) or vim.diff
-
----@alias MinuetDuetHunk integer[]
-
----@return MinuetDuetHunk[]
-local function get_hunks(state)
-    local original
-    if not state.original_lines or #state.original_lines == 0 then
-        original = ''
-    else
-        original = table.concat(state.original_lines, '\n') .. '\n'
-    end
-
-    local proposed
-    if not state.proposed_lines or #state.proposed_lines == 0 then
-        proposed = ''
-    else
-        proposed = table.concat(state.proposed_lines, '\n') .. '\n'
-    end
-
-    local hunks = diff(original, proposed, {
-        result_type = 'indices',
-        algorithm = 'histogram',
-        linematch = true,
-        ignore_whitespace = false,
-        ignore_whitespace_change = false,
-        ignore_whitespace_change_at_eol = false,
-        ignore_blank_lines = false,
-    })
-
-    -- make the LSP type checking happy.
-    if type(hunks) == 'string' or hunks == nil then
-        return {}
-    end
-    return hunks
+local function add_extmark(bufnr, state, row, opts)
+    state.extmarks = state.extmarks or {}
+    local extmark_id = api.nvim_buf_set_extmark(bufnr, M.ns_id, row, 0, opts)
+    table.insert(state.extmarks, { bufnr = bufnr, id = extmark_id })
 end
 
-local function add_extmark(bufnr, state, row, opts)
-    state.extmark_ids = state.extmark_ids or {}
-    local extmark_id = api.nvim_buf_set_extmark(bufnr, M.ns_id, row, 0, opts)
-    table.insert(state.extmark_ids, extmark_id)
+---@param value string
+---@param max_width integer
+---@return string
+local function truncate_left(value, max_width)
+    if vim.fn.strdisplaywidth(value) <= max_width then
+        return value
+    end
+    local marker = '...'
+    local char_count = vim.fn.strchars(value)
+    for start = 1, char_count do
+        local suffix = vim.fn.strcharpart(value, start)
+        if vim.fn.strdisplaywidth(marker .. suffix) <= max_width then
+            return marker .. suffix
+        end
+    end
+    return marker:sub(1, max_width)
 end
 
 --- Build styled chunks for a proposed line, inserting the cursor character
@@ -87,8 +67,8 @@ end
 
 --- Return the cursor column if the proposed line at `proposed_idx` (0-based)
 --- carries the cursor, otherwise nil.
-local function cursor_col_for(state, proposed_idx)
-    local c = state.proposed_cursor
+local function cursor_col_for(edit, proposed_idx)
+    local c = edit.cursor
     if not c then
         return nil
     end
@@ -98,14 +78,14 @@ local function cursor_col_for(state, proposed_idx)
     return nil
 end
 
-local function render_inserted_lines(bufnr, state, row, lines, proposed_indices, cursor_char, above)
+local function render_inserted_lines(bufnr, state, edit, row, lines, proposed_indices, cursor_char, above)
     if #lines == 0 then
         return
     end
 
     local virt_lines = {}
     for i, line in ipairs(lines) do
-        local col = cursor_col_for(state, proposed_indices[i])
+        local col = cursor_col_for(edit, proposed_indices[i])
         local chunks = make_chunks(line, 'MinuetDuetAdd', col, cursor_char)
         table.insert(virt_lines, chunks)
     end
@@ -116,18 +96,18 @@ local function render_inserted_lines(bufnr, state, row, lines, proposed_indices,
     })
 end
 
----@param hunk MinuetDuetHunk
-local function render_hunk(bufnr, state, hunk, cursor_char)
+---@param hunk minuet.DuetHunk
+local function render_hunk(bufnr, state, edit, hunk, cursor_char)
     local original_start, original_count, proposed_start, proposed_count = unpack(hunk)
     local pair_count = math.min(original_count, proposed_count)
-    local first_buffer_row = state.range.start_row + original_start - 1
+    local first_buffer_row = edit.range.start_row + original_start - 1
 
     for offset = 0, pair_count - 1 do
         local buffer_row = first_buffer_row + offset
         local buffer_line = api.nvim_buf_get_lines(bufnr, buffer_row, buffer_row + 1, false)[1] or ''
-        local proposed_line = state.proposed_lines[proposed_start + offset] or ''
+        local proposed_line = edit.proposed_lines[proposed_start + offset] or ''
         local proposed_idx = proposed_start + offset - 1 -- 0-based index into proposed_lines
-        local col = cursor_col_for(state, proposed_idx)
+        local col = cursor_col_for(edit, proposed_idx)
         local chunks = make_chunks(proposed_line, 'MinuetDuetAdd', col, cursor_char)
 
         add_extmark(bufnr, state, buffer_row, {
@@ -151,7 +131,7 @@ local function render_hunk(bufnr, state, hunk, cursor_char)
         local inserted_lines = {}
         local proposed_indices = {}
         for offset = pair_count, proposed_count - 1 do
-            table.insert(inserted_lines, state.proposed_lines[proposed_start + offset] or '')
+            table.insert(inserted_lines, edit.proposed_lines[proposed_start + offset] or '')
             table.insert(proposed_indices, proposed_start + offset - 1) -- 0-based
         end
 
@@ -159,7 +139,7 @@ local function render_hunk(bufnr, state, hunk, cursor_char)
         local render_above = original_count == 0 and original_start == 0
 
         if original_count == 0 then
-            insertion_anchor_row = state.range.start_row
+            insertion_anchor_row = edit.range.start_row
             if original_start > 0 then
                 insertion_anchor_row = insertion_anchor_row + original_start - 1
             end
@@ -168,6 +148,7 @@ local function render_hunk(bufnr, state, hunk, cursor_char)
         render_inserted_lines(
             bufnr,
             state,
+            edit,
             insertion_anchor_row,
             inserted_lines,
             proposed_indices,
@@ -178,9 +159,9 @@ local function render_hunk(bufnr, state, hunk, cursor_char)
 end
 
 --- Render the cursor on an unchanged line (not covered by any hunk).
----@param hunks MinuetDuetHunk[]
-local function render_cursor_on_unchanged_line(bufnr, state, hunks, cursor_char)
-    local c = state.proposed_cursor
+---@param hunks minuet.DuetHunk[]
+local function render_cursor_on_unchanged_line(bufnr, state, edit, hunks, cursor_char)
+    local c = edit.cursor
     if not c then
         return
     end
@@ -205,9 +186,9 @@ local function render_cursor_on_unchanged_line(bufnr, state, hunks, cursor_char)
     end
 
     local original_row_1based = proposed_row_1based - shift
-    local buffer_row = state.range.start_row + original_row_1based - 1
+    local buffer_row = edit.range.start_row + original_row_1based - 1
 
-    local line_text = state.proposed_lines[proposed_row_1based] or ''
+    local line_text = edit.proposed_lines[proposed_row_1based] or ''
     local chunks = make_chunks(line_text, 'MinuetDuetComment', c.col, cursor_char)
 
     add_extmark(bufnr, state, buffer_row, {
@@ -216,39 +197,115 @@ local function render_cursor_on_unchanged_line(bufnr, state, hunks, cursor_char)
     })
 end
 
-function M.clear(bufnr, state)
+function M.clear(_bufnr, state)
     if not state then
         return
     end
 
-    for _, extmark_id in ipairs(state.extmark_ids or {}) do
-        pcall(api.nvim_buf_del_extmark, bufnr, M.ns_id, extmark_id)
+    for _, extmark in ipairs(state.extmarks or {}) do
+        if api.nvim_buf_is_valid(extmark.bufnr) then
+            pcall(api.nvim_buf_del_extmark, extmark.bufnr, M.ns_id, extmark.id)
+        end
     end
 
-    state.extmark_ids = nil
+    state.extmarks = nil
+    state.preview_kind = nil
 end
 
-function M.render(bufnr, state)
+---@param origin_bufnr integer
+---@param target_bufnr integer
+---@param state minuet.DuetState
+---@param origin_row integer
+---@param target_row integer
+---@param path string
+function M.render_cross_jump(origin_bufnr, target_bufnr, state, origin_row, target_row, path)
+    local config = require('minuet').config.duet
+    M.clear(origin_bufnr, state)
+
+    local origin_lines = math.max(api.nvim_buf_line_count(origin_bufnr), 1)
+    local target_lines = math.max(api.nvim_buf_line_count(target_bufnr), 1)
+    origin_row = math.min(math.max(origin_row, 0), origin_lines - 1)
+    target_row = math.min(math.max(target_row, 0), target_lines - 1)
+
+    local template = config.preview.cross_jump_text
+    local formatted, message = pcall(string.format, template, path, target_row + 1)
+    if not formatted then
+        message = ('Next edit: %s:%d'):format(path, target_row + 1)
+    end
+    message = truncate_left(message, math.max(api.nvim_win_get_width(0) - 4, 12))
+    add_extmark(origin_bufnr, state, origin_row, {
+        virt_text = { { message, 'MinuetDuetJump' } },
+        virt_text_pos = 'eol',
+        priority = 200,
+    })
+
+    local jump_sign = config.preview.jump_sign
+    if type(jump_sign) ~= 'string' or jump_sign == '' or vim.fn.strdisplaywidth(jump_sign) > 2 then
+        jump_sign = '>>'
+    end
+    add_extmark(target_bufnr, state, target_row, {
+        sign_text = jump_sign,
+        sign_hl_group = 'MinuetDuetJump',
+        priority = 200,
+    })
+    state.preview_kind = 'cross_jump'
+end
+
+---@param bufnr integer
+---@param state minuet.DuetState
+---@param origin_row integer
+---@param target_row integer
+function M.render_jump(bufnr, state, origin_row, target_row)
     local config = require('minuet').config.duet
     M.clear(bufnr, state)
 
-    ---@type MinuetDuetHunk[]
-    local hunks = get_hunks(state)
+    local line_count = math.max(api.nvim_buf_line_count(bufnr), 1)
+    origin_row = math.min(math.max(origin_row, 0), line_count - 1)
+    target_row = math.min(math.max(target_row, 0), line_count - 1)
+    local jump_text = config.preview.jump_text
+    local formatted, message = pcall(string.format, jump_text, target_row + 1)
+    if not formatted then
+        message = ('Next edit: line %d'):format(target_row + 1)
+    end
+
+    add_extmark(bufnr, state, origin_row, {
+        virt_text = { { message, 'MinuetDuetJump' } },
+        virt_text_pos = 'eol',
+        priority = 200,
+    })
+
+    local jump_sign = config.preview.jump_sign
+    if type(jump_sign) ~= 'string' or jump_sign == '' or vim.fn.strdisplaywidth(jump_sign) > 2 then
+        jump_sign = '>>'
+    end
+    add_extmark(bufnr, state, target_row, {
+        sign_text = jump_sign,
+        sign_hl_group = 'MinuetDuetJump',
+        priority = 200,
+    })
+    state.preview_kind = 'jump'
+end
+
+---@param bufnr integer
+---@param state minuet.DuetState
+---@param edit minuet.DuetEdit
+function M.render(bufnr, state, edit)
+    local config = require('minuet').config.duet
+    M.clear(bufnr, state)
+
+    local hunks = edit.hunks
     local cursor_char = config.preview.cursor
 
     if #hunks == 0 then
-        render_cursor_on_unchanged_line(bufnr, state, hunks, cursor_char)
-        if not state.proposed_cursor then
-            utils.notify('Minuet duet predicts no text changes.', 'warn', vim.log.levels.WARN)
-        end
         return
     end
 
     for _, hunk in ipairs(hunks) do
-        render_hunk(bufnr, state, hunk, cursor_char)
+        render_hunk(bufnr, state, edit, hunk, cursor_char)
     end
 
-    render_cursor_on_unchanged_line(bufnr, state, hunks, cursor_char)
+    render_cursor_on_unchanged_line(bufnr, state, edit, hunks, cursor_char)
+    state.preview_kind = 'edit'
 end
 
 function M.is_visible(bufnr, state)
@@ -256,10 +313,12 @@ function M.is_visible(bufnr, state)
         return false
     end
 
-    for _, extmark_id in ipairs(state.extmark_ids or {}) do
-        local extmark = api.nvim_buf_get_extmark_by_id(bufnr, M.ns_id, extmark_id, {})
-        if extmark[1] ~= nil then
-            return true
+    for _, record in ipairs(state.extmarks or {}) do
+        if api.nvim_buf_is_valid(record.bufnr) then
+            local extmark = api.nvim_buf_get_extmark_by_id(record.bufnr, M.ns_id, record.id, {})
+            if extmark[1] ~= nil then
+                return true
+            end
         end
     end
     return false

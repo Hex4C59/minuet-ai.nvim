@@ -3,6 +3,8 @@ local common = require 'minuet.backends.common'
 
 local M = {}
 
+M.provider_id = 'gemini'
+
 M.is_available = function()
     local config = require('minuet').config
     return utils.get_api_key(config.provider_options.gemini.api_key) and true or false
@@ -40,16 +42,14 @@ function M.transform_openai_chat_to_gemini_chat(chat)
     return new_chat
 end
 
-local function make_request_data()
+---@param options table
+---@return table
+local function make_request_data(options)
     local config = require('minuet').config
-    local options = vim.deepcopy(config.provider_options.gemini)
-
     local few_shots = utils.get_or_eval_value(options.few_shots)
-
     few_shots = M.transform_openai_chat_to_gemini_chat(few_shots)
 
     local system = utils.make_system_prompt(options.system, config.n_completions)
-
     local request_data = {
         system_instruction = {
             parts = {
@@ -58,113 +58,121 @@ local function make_request_data()
         },
         contents = few_shots,
     }
-
-    request_data = vim.tbl_deep_extend('force', request_data, options.optional or {})
-
-    return options, request_data
+    return vim.tbl_deep_extend('force', request_data, options.optional or {})
 end
 
-function M.complete(context, callback)
+---@param context table
+---@param callback fun(items?: string[])
+---@param lifecycle? minuet.BackendLifecycle
+function M.complete(context, callback, lifecycle)
     local config = require('minuet').config
+    local metrics = require 'minuet.metrics'
+    local options = vim.deepcopy(config.provider_options.gemini)
+    local provider_name = 'Gemini'
+    local cycle_id = common.configure_cycle({
+        provider_id = M.provider_id,
+        provider = provider_name,
+        name = provider_name,
+        model = options.model,
+        n_requests = 1,
+    }, lifecycle)
+
     common.terminate_all_jobs()
 
-    local options, data = make_request_data()
+    local built, transformed_data = pcall(function()
+        local data = make_request_data(options)
+        local ctx = utils.make_chat_llm_shot(context, options.chat_input)
+        ctx = common.create_chat_messages_from_list(ctx)
+        ctx = M.transform_openai_chat_to_gemini_chat(ctx)
+        vim.list_extend(data.contents, ctx)
 
-    local ctx = utils.make_chat_llm_shot(context, options.chat_input)
-    ctx = common.create_chat_messages_from_list(ctx)
-    ctx = M.transform_openai_chat_to_gemini_chat(ctx)
+        local end_point = string.format(
+            '%s/%s:%s',
+            options.end_point,
+            options.model,
+            options.stream and 'streamGenerateContent?alt=sse' or 'generateContent'
+        )
+        local headers = {
+            ['Content-Type'] = 'application/json',
+            ['x-goog-api-key'] = utils.get_api_key(options.api_key),
+        }
+        return common.apply_transforms(options.transform, end_point, headers, data)
+    end)
 
-    vim.list_extend(data.contents, ctx)
-
-    local end_point = string.format(
-        '%s/%s:%s',
-        options.end_point,
-        options.model,
-        options.stream and 'streamGenerateContent?alt=sse' or 'generateContent'
-    )
-    local headers = {
-        ['Content-Type'] = 'application/json',
-        ['x-goog-api-key'] = utils.get_api_key(options.api_key),
-    }
-    local transformed_data = common.apply_transforms(options.transform, end_point, headers, data)
-
-    local data_file = utils.make_tmp_file(transformed_data.body)
-
-    if data_file == nil then
+    if not built or type(transformed_data) ~= 'table' then
+        utils.notify('Failed to build completion request.', 'error', vim.log.levels.ERROR)
         callback()
         return
     end
 
-    local args = utils.make_curl_args(transformed_data.end_point, transformed_data.headers, data_file)
+    local data_file, lease = utils.make_tmp_file(transformed_data.body, 1)
+    if not data_file or not lease then
+        callback()
+        return
+    end
 
-    local provider_name = 'Gemini'
-    local timestamp = os.time()
+    local made_args, args = pcall(utils.make_curl_args, transformed_data.end_point, transformed_data.headers, data_file)
+    if not made_args then
+        lease:discard()
+        utils.notify('Failed to build completion request.', 'error', vim.log.levels.ERROR)
+        callback()
+        return
+    end
 
-    utils.run_event('MinuetRequestStartedPre', {
-        provider = provider_name,
-        name = provider_name,
-        model = options.model,
-        n_requests = 1,
-        timestamp = timestamp,
-    })
-
-    local new_job = common.start_job(config.curl_cmd, args, {
-        on_exit = function(_, result)
-            utils.run_event('MinuetRequestFinished', {
-                provider = provider_name,
-                name = provider_name,
-                model = options.model,
-                n_requests = 1,
-                request_idx = 1,
-                timestamp = timestamp,
-            })
-
-            local items_raw
+    local request_id = metrics.request_attempted(cycle_id, 1)
+    local state = common.start_job(config.curl_cmd, args, {
+        cycle_id = cycle_id,
+        on_exit = function(job_state, result, ended_ns)
+            local decoded
             if options.stream then
-                items_raw = utils.stream_decode(result, data_file, provider_name, M.get_text_fn)
+                decoded = utils.stream_decode(
+                    result,
+                    data_file,
+                    provider_name,
+                    M.get_text_fn,
+                    { notify = not job_state.cancel_requested }
+                )
             else
-                items_raw = utils.no_stream_decode(result, data_file, provider_name, M.get_text_fn)
+                decoded = utils.no_stream_decode(
+                    result,
+                    data_file,
+                    provider_name,
+                    M.get_text_fn,
+                    { notify = not job_state.cancel_requested }
+                )
             end
 
-            if not items_raw then
+            metrics.request_finished(request_id, {
+                status = job_state.cancel_requested and 'cancelled' or decoded.status,
+                reason = job_state.cancel_requested and 'cancelled' or decoded.reason,
+                ended_ns = ended_ns,
+            })
+            lease:release()
+
+            if not decoded.text then
                 callback()
                 return
             end
 
-            local items = common.parse_completion_items(items_raw, provider_name)
-
+            local items = common.parse_completion_items(decoded.text, provider_name)
             items = common.filter_context_sequences_in_items(items, context)
-
             items = utils.trim_completion_items(items)
-
             callback(items)
         end,
-        on_spawn_error = function()
-            os.remove(data_file)
-            utils.run_event('MinuetRequestFinished', {
-                provider = provider_name,
-                name = provider_name,
-                model = options.model,
-                n_requests = 1,
-                request_idx = 1,
-                timestamp = timestamp,
+        on_spawn_error = function(ended_ns)
+            metrics.request_finished(request_id, {
+                status = 'spawn_error',
+                reason = 'spawn_error',
+                ended_ns = ended_ns,
             })
+            lease:release()
             callback()
         end,
     })
 
-    if not new_job then
-        return
+    if state then
+        metrics.request_started(request_id)
     end
-
-    utils.run_event('MinuetRequestStarted', {
-        provider = provider_name,
-        name = provider_name,
-        model = options.model,
-        n_requests = 1,
-        request_idx = 1,
-        timestamp = timestamp,
-    })
 end
 
 return M

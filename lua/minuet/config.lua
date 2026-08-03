@@ -179,6 +179,19 @@ local default_chat_input_prefix_first = vim.deepcopy(default_chat_input)
 default_chat_input_prefix_first.template =
     '{{{language}}}\n{{{tab}}}\n<contextBeforeCursor>\n{{{context_before_cursor}}}<cursorPosition>\n<contextAfterCursor>\n{{{context_after_cursor}}}'
 
+---@class minuet.MetricsJsonlConfig
+---@field enabled? boolean Whether to write local JSONL metrics logs. Defaults to false.
+---@field path? string Log path. Defaults to a per-session file under stdpath('state').
+---@field flush_interval? integer Flush interval in milliseconds. Defaults to 1000.
+---@field max_queue? integer Maximum number of queued log records. Defaults to 256.
+---@field max_file_size? integer Maximum log file size in bytes. Defaults to 10 MiB.
+
+---@class minuet.MetricsConfig
+---@field enabled? boolean Whether to aggregate session metrics. Defaults to true.
+---@field max_tracked_cycles? integer Number of recent cycles retained for deduplication. Defaults to 4096.
+---@field max_latency_samples? integer Number of recent samples retained per latency metric. Defaults to 2048.
+---@field jsonl? minuet.MetricsJsonlConfig Local JSONL logging options.
+
 local M = {
     -- Enable or disable auto-completion. Note that you still need to add
     -- Minuet to your cmp/blink sources. This option controls whether cmp/blink
@@ -191,6 +204,19 @@ local M = {
     },
     blink = {
         enable_auto_complete = true,
+    },
+    ---@type minuet.MetricsConfig
+    metrics = {
+        enabled = true,
+        max_tracked_cycles = 4096,
+        max_latency_samples = 2048,
+        jsonl = {
+            enabled = false,
+            path = nil,
+            flush_interval = 1000,
+            max_queue = 256,
+            max_file_size = 10 * 1024 * 1024,
+        },
     },
     -- LSP is recommended only for built-in completion. If you are using
     -- `cmp` or `blink`, utilizing LSP for code completion from Minuet is *not*

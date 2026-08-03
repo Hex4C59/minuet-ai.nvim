@@ -3,6 +3,8 @@ local base = require 'minuet.backends.openai_base'
 
 local M = {}
 
+M.provider_id = 'codestral'
+
 M.is_available = function()
     local config = require('minuet').config
     return utils.get_api_key(config.provider_options.codestral.api_key) and true or false
@@ -20,11 +22,13 @@ function M.get_text_fn_stream(json)
     return json.choices[1].delta.content
 end
 
-M.complete = function(context, callback)
+M.complete = function(context, callback, lifecycle)
     local config = require('minuet').config
 
     local options = vim.deepcopy(config.provider_options.codestral)
 
+    options.provider_id = M.provider_id
+    options.provider = 'openai_fim_compatible'
     options.name = 'Codestral'
 
     local get_text_fn = options.stream and M.get_text_fn_stream or M.get_text_fn_no_stream
@@ -35,7 +39,7 @@ M.complete = function(context, callback)
         get_text_fn = options.get_text_fn.no_stream
     end
 
-    base.complete_openai_fim_base(options, get_text_fn, context, callback)
+    base.complete_openai_fim_base(options, get_text_fn, context, callback, lifecycle)
 end
 
 return M

@@ -5,6 +5,7 @@ if vim.tbl_isempty(vim.api.nvim_get_hl(0, { name = 'LspKindMinuet' })) then
 end
 
 local utils = require 'minuet.utils'
+local metrics = require 'minuet.metrics'
 
 M.augroup = vim.api.nvim_create_augroup('MinuetLSP', { clear = true })
 
@@ -122,8 +123,17 @@ M.request_handler['textDocument/completion'] = function(_, params, callback, not
         utils.notify('Minuet completion started', 'verbose')
 
         local provider = require('minuet.backends.' .. config.provider)
+        local cycle_id = metrics.begin_cycle {
+            channel = 'completion',
+            frontend = 'lsp_completion',
+            provider_id = config.provider,
+        }
 
         provider.complete(context, function(data)
+            if data and next(data) then
+                metrics.cycle_has_result(cycle_id)
+            end
+
             if not data then
                 callback(nil, { isIncomplete = false, items = {} })
                 return
@@ -202,7 +212,10 @@ M.request_handler['textDocument/completion'] = function(_, params, callback, not
             if notify_callback then
                 notify_callback(id)
             end
-        end)
+        end, {
+            cycle_id = cycle_id,
+            frontend = 'lsp_completion',
+        })
     end
 
     if config.throttle > 0 and st.is_in_throttle then
@@ -263,8 +276,17 @@ M.request_handler['textDocument/inlineCompletion'] = function(_, params, callbac
         utils.notify('Minuet inline completion started', 'verbose')
 
         local provider = require('minuet.backends.' .. config.provider)
+        local cycle_id = metrics.begin_cycle {
+            channel = 'completion',
+            frontend = 'lsp_inline_completion',
+            provider_id = config.provider,
+        }
 
         provider.complete(context, function(data)
+            if data and next(data) then
+                metrics.cycle_has_result(cycle_id)
+            end
+
             if not data then
                 callback(nil, { items = {} })
                 return
@@ -294,7 +316,10 @@ M.request_handler['textDocument/inlineCompletion'] = function(_, params, callbac
             if notify_callback then
                 notify_callback(id)
             end
-        end)
+        end, {
+            cycle_id = cycle_id,
+            frontend = 'lsp_inline_completion',
+        })
     end
 
     if config.throttle > 0 and st.is_in_throttle then
