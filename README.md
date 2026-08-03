@@ -1492,11 +1492,13 @@ the normal Buffer/jumplist path, and reveals the diff; the second revalidates
 both buffers and writes only the target. It does not save either buffer.
 
 The provider context includes the current workspace-relative path, filetype,
-bounded recently changed identifiers, and bounded nearby diagnostic messages.
-These values are not persisted by Minuet. Source from another buffer is not
-included unless `duet.context.related_files.enabled` is explicitly enabled;
-even then, only safe, already loaded buffers matched by a literal relative
-import/require are eligible.
+bounded recently changed identifiers, bounded nearby diagnostic messages, and
+the session-wide recent-edit history described below. That history may contain
+bounded unified-diff snippets from other tracked buffers and workspaces. Full
+source from another buffer is not included unless
+`duet.context.related_files.enabled` is explicitly enabled; even then, only
+safe, already loaded buffers matched by a literal relative import/require are
+eligible. These values are not persisted by Minuet.
 
 Example keymaps:
 
@@ -1687,6 +1689,14 @@ an empty edit history.
 - `true`: recording starts at plugin setup, so even the first prediction
 carries the session's edit history.
 - `false`: the recorder is disabled entirely.
+
+The recorder keeps one bounded history for the current Neovim session. It is
+shared across all eligible buffers and is not partitioned by workspace, current
+working directory, or `duet.scope`; consequently, a Duet prompt can include
+unified-diff snippets from another buffer or workspace visited since recording
+started. `duet.scope` controls prediction target selection only. Use
+`recent_edits.enable_predicates`, disable the recorder, or use separate Neovim
+sessions when edits from different workspaces must remain isolated.
 
 To prevent sensitive buffers from being tracked in the edit history, configure
 `recent_edits.enable_predicates` with a list of functions, each receiving a
